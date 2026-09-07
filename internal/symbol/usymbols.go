@@ -26,12 +26,14 @@ import (
 )
 
 type elfCache struct {
-	secs sections
-	syms symbols
+	secs   sections
+	syms   symbols
+	goSyms *goSymTable
 }
 
 type libCache struct {
-	syms symbols
+	syms   symbols
+	goSyms *goSymTable
 }
 
 type cacheKey struct {
@@ -109,6 +111,9 @@ func (r *UsymResolver) resolveAddr(pid uint32, addr uint64) string {
 		if sym := cache.syms.resolve(addr); sym != "" {
 			return r.displayName(sym)
 		}
+		if name := cache.goSyms.resolve(addr); name != "" {
+			return name
+		}
 		return failFrame("elf-no-sym", "")
 	}
 
@@ -136,6 +141,12 @@ func (r *UsymResolver) resolveAddr(pid uint32, addr uint64) string {
 	}
 	if sym := libCache.syms.resolve(addr - baseAddr); sym != "" {
 		return r.displayName(sym)
+	}
+	if name := libCache.goSyms.resolve(addr); name != "" {
+		return name
+	}
+	if name := libCache.goSyms.resolve(addr - baseAddr); name != "" {
+		return name
 	}
 	return failFrame("lib-no-sym", m.Pathname)
 }
@@ -189,8 +200,9 @@ func (r *UsymResolver) loadElfCaches(pid uint32) (*elfCache, error) {
 	secs.sort()
 
 	cache = &elfCache{
-		secs: secs,
-		syms: elfSymbols(f),
+		secs:   secs,
+		syms:   elfSymbols(f),
+		goSyms: loadGoSymTable(f, path),
 	}
 	r.exeCache[key] = cache
 	r.exeKeys[pid] = key
@@ -235,7 +247,10 @@ func (r *UsymResolver) loadLibCache(pid uint32, libPath string) (*libCache, erro
 	}
 	defer f.Close()
 
-	cache = &libCache{syms: elfSymbols(f)}
+	cache = &libCache{
+		syms:   elfSymbols(f),
+		goSyms: loadGoSymTable(f, libPath),
+	}
 	r.libcaches[key] = cache
 	r.libKeys[libPath] = key
 	return cache, nil
