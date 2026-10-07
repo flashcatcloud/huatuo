@@ -95,22 +95,18 @@ func ParseTree(startTime time.Time, profileType string, data []*TreeItem, opt *P
 func ParseCollapsedData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
 	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
-		for _, out := range outputs {
-			if out.PID == 0 || out.Output == "" {
-				goto fallback
-			}
+		if kept := nonemptySampleOutputs(outputs); len(kept) > 0 {
+			return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt,
+				func(pid int) ([]byte, error) {
+					threadName, err := extractJavaMainClassFromPid(pid)
+					if err != nil {
+						return nil, err
+					}
+					return []byte(fmt.Sprintf("process %d:%s", pid, threadName)), nil
+				})
 		}
-		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt,
-			func(pid int) ([]byte, error) {
-				threadName, err := extractJavaMainClassFromPid(pid)
-				if err != nil {
-					return nil, err
-				}
-				return []byte(fmt.Sprintf("process %d:%s", pid, threadName)), nil
-			})
 	}
 
-fallback:
 	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractJavaMainClassFromPid)
 }
 
@@ -122,29 +118,45 @@ fallback:
 func ParseRawData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
 	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
-		for _, out := range outputs {
-			if out.PID == 0 || out.Output == "" {
-				goto fallback
-			}
-			raw := []byte(out.Output)
-			if bytes.Contains(raw, []byte("py-spy>")) {
-				lines := bytes.Split(raw, []byte("\n"))
-				buf := &bytes.Buffer{}
-				for _, line := range lines {
-					line = bytes.TrimSpace(line)
-					if !bytes.HasPrefix(line, []byte("py-spy>")) {
-						buf.Write(line)
-						buf.WriteByte('\n')
-					}
-				}
-				out.Output = buf.String()
-			}
+		kept := nonemptySampleOutputs(outputs)
+		for i := range kept {
+			kept[i].Output = stripPyspyPrefix(kept[i].Output)
 		}
-		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt, nil)
+		if len(kept) > 0 {
+			return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt, nil)
+		}
 	}
 
-fallback:
 	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractPythonThreadNameFromPid)
+}
+
+func nonemptySampleOutputs(outputs []SampleOutput) []SampleOutput {
+	kept := make([]SampleOutput, 0, len(outputs))
+	for _, out := range outputs {
+		if out.PID == 0 || out.Output == "" {
+			continue
+		}
+		kept = append(kept, out)
+	}
+	return kept
+}
+
+func stripPyspyPrefix(output string) string {
+	raw := []byte(output)
+	if !bytes.Contains(raw, []byte("py-spy>")) {
+		return output
+	}
+	lines := bytes.Split(raw, []byte("\n"))
+	buf := &bytes.Buffer{}
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if bytes.HasPrefix(line, []byte("py-spy>")) {
+			continue
+		}
+		buf.Write(line)
+		buf.WriteByte('\n')
+	}
+	return buf.String()
 }
 
 // Profiling output for each PID.
