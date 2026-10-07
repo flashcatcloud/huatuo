@@ -121,7 +121,6 @@ func (a *pythonAggregator) Snapshot(pctx *pcontext.ProfilerContext) (any, error)
 	}
 
 	pprofData, err := profiler.ParseRawData(
-		pctx.Ctx,
 		&profiler.ParseInput{
 			StartTime:    a.startedAt,
 			ProfileType:  profiler.ProfileTypeCpuSample,

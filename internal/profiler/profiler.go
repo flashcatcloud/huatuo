@@ -16,7 +16,6 @@ package profiler
 
 import (
 	"bytes"
-	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -93,7 +92,7 @@ func ParseTree(startTime time.Time, profileType string, data []*TreeItem, opt *P
 // e.g., Java example:
 // HotCode.main;HotCode.hotmethod3;java/util/UUID.randomUUID;java/security/SecureRandom.nextBytes;
 // read;entry_SYSCALL_64_after_hwframe_[k];do_syscall_64_[k];ksys_read_[k];__check_object_size_[k] 1
-func ParseCollapsedData(ctx context.Context, input *ParseInput) (*ProfileData, error) {
+func ParseCollapsedData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
 	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
 		for _, out := range outputs {
@@ -101,7 +100,7 @@ func ParseCollapsedData(ctx context.Context, input *ParseInput) (*ProfileData, e
 				goto fallback
 			}
 		}
-		return parseMultiProcessData(ctx, input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt,
+		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt,
 			func(pid int) ([]byte, error) {
 				threadName, err := extractJavaMainClassFromPid(pid)
 				if err != nil {
@@ -112,7 +111,7 @@ func ParseCollapsedData(ctx context.Context, input *ParseInput) (*ProfileData, e
 	}
 
 fallback:
-	return parseCommonData(ctx, input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractJavaMainClassFromPid)
+	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractJavaMainClassFromPid)
 }
 
 // ParseRawData parses a raw profile (e.g. py-spy output) into *ProfileData.
@@ -120,7 +119,7 @@ fallback:
 // e.g., Python example:
 // process 3577332:"python /app/test.py"; __bootstrap (threading.py:784);__bootstrap_inner (threading.py:811);
 // run (threading.py:764);worker (more-complex-demo.py:22); level1 (more-complex-demo.py:18);level2 (more-complex-demo.py:15) 10
-func ParseRawData(ctx context.Context, input *ParseInput) (*ProfileData, error) {
+func ParseRawData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
 	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
 		for _, out := range outputs {
@@ -141,11 +140,11 @@ func ParseRawData(ctx context.Context, input *ParseInput) (*ProfileData, error) 
 				out.Output = buf.String()
 			}
 		}
-		return parseMultiProcessData(ctx, input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt, nil)
+		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, outputs, input.Opt, nil)
 	}
 
 fallback:
-	return parseCommonData(ctx, input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractPythonThreadNameFromPid)
+	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractPythonThreadNameFromPid)
 }
 
 // Profiling output for each PID.
@@ -155,13 +154,7 @@ type SampleOutput struct {
 }
 
 // parseMultiProcessData parses profiles of multiple PIDs from SampleOutput.
-func parseMultiProcessData(ctx context.Context, startTime time.Time, profileType, profilerName string, outputs []SampleOutput, opt *ParseOption, getThreadName func(pid int) ([]byte, error)) (*ProfileData, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
+func parseMultiProcessData(startTime time.Time, profileType, profilerName string, outputs []SampleOutput, opt *ParseOption, getThreadName func(pid int) ([]byte, error)) (*ProfileData, error) {
 	var tree []*TreeItem
 
 	for _, out := range outputs {
@@ -232,13 +225,7 @@ func parseMultiProcessData(ctx context.Context, startTime time.Time, profileType
 }
 
 // parseCommonData parses profile of single PID from raw data.
-func parseCommonData(ctx context.Context, startTime time.Time, profileType string, b []byte, opt *ParseOption, pid int, getThreadName func(int) (string, error)) (*ProfileData, error) {
-	select {
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	default:
-	}
-
+func parseCommonData(startTime time.Time, profileType string, b []byte, opt *ParseOption, pid int, getThreadName func(int) (string, error)) (*ProfileData, error) {
 	lines := bytes.Split(b, []byte("\n"))
 	tree := make([]*TreeItem, 0, len(lines))
 

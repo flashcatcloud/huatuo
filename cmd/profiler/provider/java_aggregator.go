@@ -127,7 +127,6 @@ func (a *javaAggregator) snapshotPprof(pctx *pcontext.ProfilerContext) (any, err
 	}
 
 	pprofData, err := profiler.ParseCollapsedData(
-		pctx.Ctx,
 		&profiler.ParseInput{
 			StartTime:    a.startedAt,
 			ProfileType:  sampleType,
