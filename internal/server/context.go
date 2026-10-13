@@ -1,4 +1,4 @@
-// Copyright 2025 The HuaTuo Authors
+// Copyright 2025, 2026 The HuaTuo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -19,6 +19,8 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/ccfos/huatuo/internal/server/response"
+
 	httpGin "github.com/gin-gonic/gin"
 	httpBinding "github.com/gin-gonic/gin/binding"
 )
@@ -31,6 +33,8 @@ type Context struct {
 	c       *httpGin.Context // private, never exposed
 	UserID  string
 	IsAdmin bool
+
+	errorStatusMapper response.HTTPStatusMapper
 }
 
 // HandlerContextFunc is a middleware/handler that receives a custom Context.
@@ -40,8 +44,12 @@ type HandlerContextFunc func(*Context)
 type ErrHandlerContextFunc func(*Context) error
 
 // newContext creates a Context and stores it in the gin.Context.
-func newContext(c *httpGin.Context) *Context {
-	ctx := &Context{c: c}
+func newContext(c *httpGin.Context, statusMappers ...response.HTTPStatusMapper) *Context {
+	statusMapper := response.LegacyHTTPStatusForErrorCode
+	if len(statusMappers) > 0 && statusMappers[0] != nil {
+		statusMapper = statusMappers[0]
+	}
+	ctx := &Context{c: c, errorStatusMapper: statusMapper}
 	c.Set(contextKey, ctx)
 	return ctx
 }
@@ -58,11 +66,16 @@ func internalContext(c *httpGin.Context) *Context {
 }
 
 // middlewareContext injects a custom Context into every request.
-func middlewareContext() httpGin.HandlerFunc {
+func middlewareContext(statusMappers ...response.HTTPStatusMapper) httpGin.HandlerFunc {
 	return func(c *httpGin.Context) {
-		newContext(c)
+		newContext(c, statusMappers...)
 		c.Next()
 	}
+}
+
+// ErrorStatusMapper returns the process-specific API error status directory.
+func (ctx *Context) ErrorStatusMapper() response.HTTPStatusMapper {
+	return ctx.errorStatusMapper
 }
 
 // Param returns the URL path parameter for the given key (e.g. "id" for "/:id").
@@ -148,9 +161,9 @@ func (ctx *Context) CanAccessTask(taskUserID string) bool {
 
 const (
 	// DefaultListLimit is the default page size for list endpoints.
-	DefaultListLimit = 50
+	DefaultListLimit = 100
 	// MaxListLimit is the maximum allowed page size.
-	MaxListLimit = 500
+	MaxListLimit = 1000
 )
 
 // ListParams holds pagination and sorting parameters for list endpoints.
@@ -162,7 +175,7 @@ type ListParams struct {
 }
 
 // ParseListParams reads limit/offset/sort from the query string.
-// Defaults: limit=50, offset=0. limit is clamped to [1, 500].
+// Defaults apply only to absent parameters; explicit limits must be positive.
 func (ctx *Context) ParseListParams() (ListParams, error) {
 	p := ListParams{Limit: DefaultListLimit}
 
@@ -172,7 +185,7 @@ func (ctx *Context) ParseListParams() (ListParams, error) {
 			return p, fmt.Errorf("invalid limit %q", v)
 		}
 		if n > MaxListLimit {
-			n = MaxListLimit
+			return p, fmt.Errorf("limit must not exceed %d", MaxListLimit)
 		}
 		p.Limit = n
 	}

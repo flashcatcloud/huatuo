@@ -32,9 +32,8 @@ var (
 	ErrEncodeFailed  = errors.New("storage: encode failed")
 	ErrDecodeFailed  = errors.New("storage: decode failed")
 	ErrAlreadyExists = errors.New("storage: already exists")
+	ErrConflict      = errors.New("storage: conflict")
 
-	// ErrNegativePagination is returned when Limit or Offset is negative.
-	ErrNegativePagination = fmt.Errorf("%w: limit and offset must be non-negative", ErrInvalidQuery)
 	// ErrNegativeSize is returned when a Terms size is negative.
 	ErrNegativeSize = fmt.Errorf("%w: size must be non-negative", ErrInvalidQuery)
 	// ErrInRequiresSlice is returned when an OpIn filter value is not a slice or array.
@@ -84,7 +83,7 @@ type Op string
 const (
 	// OpEq matches values equal to the filter value.
 	OpEq Op = "eq"
-	// OpNe matches values not equal to the filter value.
+	// OpNe matches existing non-null values not equal to the filter value.
 	OpNe Op = "ne"
 	// OpGt matches values greater than the filter value.
 	OpGt Op = "gt"
@@ -96,9 +95,17 @@ const (
 	OpLte Op = "lte"
 	// OpIn matches values contained in the filter value.
 	OpIn Op = "in"
+	// OpExists matches fields with a non-null queryable value, including empty strings.
+	OpExists Op = "exists"
+	// OpNotExists matches fields without a non-null queryable value.
+	OpNotExists Op = "not_exists"
 )
 
-// Filter describes one field predicate in a query.
+// Filter describes one field predicate in a query. Comparisons accept non-null
+// scalar values; OpIn accepts a non-empty slice or array of scalars. Existence
+// operators require a nil Value. Empty strings are literal values, not absence.
+// Elasticsearch callers must select fields mapped for exact comparisons,
+// such as keyword fields; the backend does not resolve text subfields.
 type Filter struct {
 	Field string
 	Op    Op
@@ -111,12 +118,35 @@ type Sort struct {
 	Desc  bool
 }
 
-// Query describes filters, ordering, and pagination.
+// DefaultBatchSize bounds a query's working set without limiting its total results.
+const DefaultBatchSize = 100
+
+// Query describes record selection. For record reads, Limit must be positive;
+// Offset is applied before Limit and BatchSize zero selects DefaultBatchSize.
+// storage.Store.Query validates these constraints before calling a backend.
+// Count and Values use only Filters and ignore Sorts, Limit, Offset, and BatchSize.
 type Query struct {
+	Filters   []Filter
+	Sorts     []Sort
+	Limit     int
+	BatchSize int
+	Offset    int
+}
+
+// ReadSize returns the effective batch size for this bounded query.
+func (q Query) ReadSize() int {
+	size := q.BatchSize
+	if size == 0 {
+		size = DefaultBatchSize
+	}
+	return min(size, q.Limit)
+}
+
+// DeleteQuery selects records for synchronous bulk deletion. Limit zero
+// deletes every matching record; a positive limit bounds the deleted count.
+type DeleteQuery struct {
 	Filters []Filter
-	Sorts   []Sort
 	Limit   int
-	Offset  int
 }
 
 // Record is the backend-neutral persisted representation.
@@ -126,6 +156,25 @@ type Record struct {
 	Fields map[string]any
 }
 
+// SaveMode selects the write precondition applied by a backend.
+type SaveMode uint8
+
+const (
+	// SaveModeUpsert creates or replaces a record without a precondition.
+	SaveModeUpsert SaveMode = iota
+	// SaveModeCreateOnly creates a record only when its ID does not exist.
+	SaveModeCreateOnly
+	// SaveModeConditional updates a record only when all Conditions match.
+	SaveModeConditional
+)
+
+// SaveOptions describes write preconditions and visibility requirements.
+type SaveOptions struct {
+	Mode              SaveMode
+	Conditions        []Filter
+	WaitForVisibility bool
+}
+
 // Kind classifies an indexed field so backends that need typed columns can
 // create the right one. Backends that keep every field as text ignore it.
 type Kind string
@@ -133,7 +182,7 @@ type Kind string
 const (
 	// KindString is the zero value: the field is stored as text.
 	KindString Kind = ""
-	// KindTime marks a field whose values are time.Time.
+	// KindTime marks a field containing time.Time or timeutil.Timestamp values.
 	KindTime Kind = "time"
 )
 
@@ -147,7 +196,7 @@ type Index struct {
 type Mapper[T any] interface {
 	ID(entity T) string
 	Encode(entity T) ([]byte, error)
-	Decode(data []byte) (T, error)
+	Decode(record Record) (T, error)
 	Fields(entity T) (map[string]any, error)
 	Indexes() []Index
 }
@@ -161,16 +210,24 @@ type Mapper[T any] interface {
 // once and never reused; calling Save after Close is undefined.
 type Backend interface {
 	Init(ctx context.Context, collection string, indexes []Index) error
-	Save(ctx context.Context, rec Record) error
+	Save(ctx context.Context, rec Record, options SaveOptions) error
 	Get(ctx context.Context, id string) (Record, error)
 	Delete(ctx context.Context, id string) error
-	Query(ctx context.Context, q Query) ([]Record, error)
+	DeleteByQuery(ctx context.Context, query DeleteQuery) (int64, error)
+	// Query receives pagination and a non-nil consumer validated by storage.Store.
+	// It calls consume synchronously with nonempty, independently owned batches.
+	// It delivers at most q.Limit records and stops on the first error. Previously
+	// completed callbacks are not rolled back. Consumers must not synchronously
+	// reenter the same backend while it holds a database connection.
+	Query(ctx context.Context, q Query, consume func([]Record) error) error
+	// Count uses only q.Filters and ignores record pagination and sorting.
 	Count(ctx context.Context, q Query) (int64, error)
+	// Values uses only q.Filters; storage.Store validates size before dispatch.
 	Values(ctx context.Context, field string, q Query, size int) ([]string, error)
 	Close(ctx context.Context) error
 }
 
-// Creator is implemented by backends that support insert-only writes.
-type Creator interface {
-	Create(ctx context.Context, rec Record) error
+// Pinger verifies that a backend can serve requests.
+type Pinger interface {
+	Ping(ctx context.Context) error
 }

@@ -16,13 +16,16 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"huatuo-bamai/cmd/huatuo-apiserver/config"
-	"huatuo-bamai/internal/log"
-	"huatuo-bamai/internal/profiler/service"
-	"huatuo-bamai/internal/storage/driver"
-	"huatuo-bamai/internal/strutil"
+	"github.com/ccfos/huatuo/cmd/huatuo-apiserver/config"
+	"github.com/ccfos/huatuo/internal/log"
+	"github.com/ccfos/huatuo/internal/profiling/publication"
+	profilequery "github.com/ccfos/huatuo/internal/profiling/query"
+	"github.com/ccfos/huatuo/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/strutil"
+	profilingstore "github.com/ccfos/huatuo/pkg/profiling/store"
 )
 
 func setupProfileQueryService(ctx context.Context, d *Daemon) (func(context.Context) error, error) {
@@ -32,19 +35,29 @@ func setupProfileQueryService(ctx context.Context, d *Daemon) (func(context.Cont
 		return nil, nil
 	}
 
-	profileQueryService, err := service.NewService(ctx, storageConfig)
+	profileStorage, err := profilingstore.NewWithBackendConfig(ctx, storageConfig)
 	if err != nil {
-		return nil, fmt.Errorf("initialize profile query service: %w", err)
+		return nil, fmt.Errorf("initialize profile storage: %w", err)
 	}
+	profileQueryService, err := profilequery.NewProfileQueryService(profileStorage)
+	if err != nil {
+		_ = profileStorage.Close(ctx)
+		return nil, err
+	}
+	publicationStore, err := publication.NewFromConfig(ctx, storageConfig)
+	if err != nil {
+		_ = profileStorage.Close(ctx)
+		return nil, fmt.Errorf("initialize profiling publication Store: %w", err)
+	}
+	d.profileStorage = profileStorage
 	d.profileQueryService = profileQueryService
+	d.publications = publicationStore
 
-	return profileQueryService.Close, nil
+	return func(ctx context.Context) error {
+		return errors.Join(profileStorage.Close(ctx), publicationStore.Close(ctx))
+	}, nil
 }
 
-// profileStorageConfig selects the backend profiles are read from, returning
-// nil when none is configured. Doris takes precedence so an operator migrating
-// off Elasticsearch can keep both sections in place and switch the read side by
-// adding the Doris section alone.
 func profileStorageConfig(cfg *config.Config) *driver.Config {
 	if cfg.Doris.Enabled() {
 		return cfg.Doris.DriverConfig()

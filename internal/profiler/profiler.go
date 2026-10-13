@@ -18,11 +18,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
+
+	hostprocess "github.com/ccfos/huatuo/internal/process"
 
 	ptree "github.com/grafana/pyroscope/pkg/og/storage/tree"
 	"github.com/shirou/gopsutil/process"
@@ -94,17 +95,16 @@ func ParseTree(startTime time.Time, profileType string, data []*TreeItem, opt *P
 // read;entry_SYSCALL_64_after_hwframe_[k];do_syscall_64_[k];ksys_read_[k];__check_object_size_[k] 1
 func ParseCollapsedData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
-	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
-		if kept := nonemptySampleOutputs(outputs); len(kept) > 0 {
-			return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt,
-				func(pid int) ([]byte, error) {
-					threadName, err := extractJavaMainClassFromPid(pid)
-					if err != nil {
-						return nil, err
-					}
-					return []byte(fmt.Sprintf("process %d:%s", pid, threadName)), nil
-				})
-		}
+	if err := json.Unmarshal(input.Data, &outputs); err == nil && outputs != nil {
+		kept := nonemptySampleOutputs(outputs)
+		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt,
+			func(pid int) ([]byte, error) {
+				threadName, err := extractJavaMainClassFromPid(pid)
+				if err != nil {
+					return nil, err
+				}
+				return []byte(fmt.Sprintf("process %d:%s", pid, threadName)), nil
+			})
 	}
 
 	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractJavaMainClassFromPid)
@@ -117,14 +117,12 @@ func ParseCollapsedData(input *ParseInput) (*ProfileData, error) {
 // run (threading.py:764);worker (more-complex-demo.py:22); level1 (more-complex-demo.py:18);level2 (more-complex-demo.py:15) 10
 func ParseRawData(input *ParseInput) (*ProfileData, error) {
 	var outputs []SampleOutput
-	if err := json.Unmarshal(input.Data, &outputs); err == nil && len(outputs) > 0 {
+	if err := json.Unmarshal(input.Data, &outputs); err == nil && outputs != nil {
 		kept := nonemptySampleOutputs(outputs)
 		for i := range kept {
 			kept[i].Output = stripPyspyPrefix(kept[i].Output)
 		}
-		if len(kept) > 0 {
-			return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt, nil)
-		}
+		return parseMultiProcessData(input.StartTime, input.ProfileType, input.ProfilerName, kept, input.Opt, nil)
 	}
 
 	return parseCommonData(input.StartTime, input.ProfileType, input.Data, input.Opt, input.PID, extractPythonThreadNameFromPid)
@@ -133,7 +131,7 @@ func ParseRawData(input *ParseInput) (*ProfileData, error) {
 func nonemptySampleOutputs(outputs []SampleOutput) []SampleOutput {
 	kept := make([]SampleOutput, 0, len(outputs))
 	for _, out := range outputs {
-		if out.PID == 0 || out.Output == "" {
+		if out.PID == 0 || strings.TrimSpace(out.Output) == "" {
 			continue
 		}
 		kept = append(kept, out)
@@ -363,8 +361,7 @@ func extractJavaMainClassFromPid(pid int) (string, error) {
 }
 
 func extractPythonThreadNameFromPid(pid int) (string, error) {
-	exePath := fmt.Sprintf("/proc/%d/exe", pid)
-	resolvedExe, err := os.Readlink(exePath)
+	resolvedExe, err := hostprocess.Executable(pid)
 	if err != nil {
 		return "", err
 	}

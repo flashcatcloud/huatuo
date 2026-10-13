@@ -20,7 +20,7 @@ import (
 	"net"
 	"time"
 
-	"huatuo-bamai/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/storage/driver"
 
 	"github.com/go-sql-driver/mysql"
 )

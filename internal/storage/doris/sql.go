@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"huatuo-bamai/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/storage/driver"
 )
 
 // Reserved column names. Indexed fields are prefixed so a field literally
@@ -40,8 +40,7 @@ const (
 const timeLayout = "2006-01-02 15:04:05.000000"
 
 // inputTimeLayouts are the layouts callers are known to send as filter values.
-// driver.NormalizeValue emits the second one; the profile query service emits
-// RFC3339 variants.
+// The shared driver emits RFC3339Nano; older clients also use the other layouts.
 var inputTimeLayouts = []string{
 	time.RFC3339Nano,
 	"2006-01-02 15:04:05.000 -0700",
@@ -93,9 +92,8 @@ func normalizeValue(value any, loc *time.Location) any {
 		loc = time.UTC
 	}
 
+	value = driver.NormalizeValue(value)
 	switch typed := value.(type) {
-	case time.Time:
-		return typed.In(loc).Format(timeLayout)
 	case string:
 		for _, layout := range inputTimeLayouts {
 			if parsed, err := time.Parse(layout, typed); err == nil {
@@ -195,10 +193,8 @@ func buildCreateTableSQL(database, table string, indexes []driver.Index, opts Ta
 			textColumns = append(textColumns, column)
 		}
 	}
-	// fields is a small flat scalar map, so VARIANT keeps every field a mapper
-	// emits queryable even when it was never declared as an index — a field
-	// that is not declared then degrades to "queryable but unindexed" instead
-	// of vanishing.
+	// Keep mapper metadata for record reads; only declared indexes have
+	// physical columns used by predicates and aggregation.
 	//
 	// data stays opaque: Record.Data is whatever Mapper.Encode produced, and
 	// the backend must round-trip it untouched. VARIANT would both assume it
@@ -306,12 +302,25 @@ func buildWhereSQL(filters []driver.Filter, loc *time.Location) (string, []any, 
 	args := make([]any, 0, len(filters))
 
 	for _, filter := range filters {
+		value, err := driver.NormalizeFilterValue(filter)
+		if err != nil {
+			return "", nil, err
+		}
+		filter.Value = value
 		column, err := resolveColumn(filter.Field)
 		if err != nil {
 			return "", nil, err
 		}
 
 		expr := quote(column)
+		if filter.Op == driver.OpExists {
+			clauses = append(clauses, expr+" IS NOT NULL")
+			continue
+		}
+		if filter.Op == driver.OpNotExists {
+			clauses = append(clauses, expr+" IS NULL")
+			continue
+		}
 		if opSQL, ok := binaryOpSQL[filter.Op]; ok {
 			clauses = append(clauses, expr+" "+opSQL+" ?")
 			args = append(args, normalizeValue(filter.Value, loc))
@@ -371,7 +380,7 @@ func appendPagination(sb *strings.Builder, args []any, limit, offset int) []any 
 
 func buildSelectSQL(database, table string, q driver.Query, loc *time.Location) (string, []any, error) {
 	if q.Limit < 0 || q.Offset < 0 {
-		return "", nil, driver.ErrNegativePagination
+		return "", nil, driver.ErrInvalidQuery
 	}
 
 	whereSQL, args, err := buildWhereSQL(q.Filters, loc)
@@ -398,10 +407,6 @@ func buildSelectSQL(database, table string, q driver.Query, loc *time.Location) 
 }
 
 func buildCountSQL(database, table string, q driver.Query, loc *time.Location) (string, []any, error) {
-	if q.Limit < 0 || q.Offset < 0 {
-		return "", nil, driver.ErrNegativePagination
-	}
-
 	whereSQL, args, err := buildWhereSQL(q.Filters, loc)
 	if err != nil {
 		return "", nil, err
@@ -418,12 +423,8 @@ func buildValuesSQL(
 	database, table, field string,
 	q driver.Query,
 	size int,
-	kinds map[string]driver.Kind,
 	loc *time.Location,
 ) (string, []any, error) {
-	if q.Limit < 0 || q.Offset < 0 {
-		return "", nil, driver.ErrNegativePagination
-	}
 	if size < 0 {
 		return "", nil, driver.ErrNegativeSize
 	}
@@ -443,12 +444,8 @@ func buildValuesSQL(
 	if whereSQL != "" {
 		sb.WriteString(whereSQL + " AND ")
 	}
-	// A DATETIME column cannot be compared against '', so the blank guard only
-	// applies to text columns.
 	fmt.Fprintf(&sb, "%s IS NOT NULL", quote(column))
-	if kinds[column] != driver.KindTime {
-		fmt.Fprintf(&sb, " AND %s != ''", quote(column))
-	}
+
 	sb.WriteString(" ORDER BY term ASC")
 	if size > 0 {
 		sb.WriteString(" LIMIT ?")

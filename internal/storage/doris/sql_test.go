@@ -20,11 +20,11 @@ import (
 	"testing"
 	"time"
 
-	"huatuo-bamai/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/storage/driver"
 )
 
 var testIndexes = []driver.Index{
-	{Field: "uploaded_time", Kind: driver.KindTime},
+	{Field: "uploaded_timestamp", Kind: driver.KindTime},
 	{Field: "hostname"},
 	{Field: "tracer_data.flamedata.profile_type"},
 }
@@ -33,7 +33,7 @@ func testOptions() TableOptions {
 	return TableOptions{
 		Buckets:        4,
 		Replicas:       1,
-		PartitionField: "uploaded_time",
+		PartitionField: "uploaded_timestamp",
 		RetentionDays:  30,
 	}
 }
@@ -134,9 +134,9 @@ func TestBuildCreateTableSQL(t *testing.T) {
 	wants := []string{
 		// The partition column must lead the key, and Doris requires key
 		// columns to come first in the column list.
-		"`f_uploaded_time` DATETIME(6) NOT NULL",
-		"UNIQUE KEY(`f_uploaded_time`, `id`)",
-		"PARTITION BY RANGE(`f_uploaded_time`) ()",
+		"`f_uploaded_timestamp` DATETIME(6) NOT NULL",
+		"UNIQUE KEY(`f_uploaded_timestamp`, `id`)",
+		"PARTITION BY RANGE(`f_uploaded_timestamp`) ()",
 		"`f_hostname` VARCHAR(4096) NULL",
 		"`fields` VARIANT NULL",
 		"`data` STRING NULL",
@@ -153,7 +153,7 @@ func TestBuildCreateTableSQL(t *testing.T) {
 
 	// Time columns carry no inverted index: partition pruning and the key
 	// prefix already cover them.
-	if strings.Contains(sql, "idx_f_uploaded_time") {
+	if strings.Contains(sql, "idx_f_uploaded_timestamp") {
 		t.Errorf("buildCreateTableSQL() indexed a time column\ngot:\n%s", sql)
 	}
 }
@@ -176,7 +176,7 @@ func TestBuildCreateTableSQLWithoutPartitionOrIndex(t *testing.T) {
 		}
 	}
 	// Without a partition column the time field is an ordinary column.
-	if !strings.Contains(sql, "`f_uploaded_time` DATETIME(6) NULL") {
+	if !strings.Contains(sql, "`f_uploaded_timestamp` DATETIME(6) NULL") {
 		t.Errorf("buildCreateTableSQL() time column = unexpected\ngot:\n%s", sql)
 	}
 }
@@ -222,14 +222,14 @@ func TestBuildSelectSQL(t *testing.T) {
 			query: driver.Query{
 				Filters: []driver.Filter{
 					{Field: "hostname.keyword", Op: driver.OpEq, Value: "node-1"},
-					{Field: "uploaded_time", Op: driver.OpGte, Value: "2026-08-20T18:05:06Z"},
+					{Field: "uploaded_timestamp", Op: driver.OpGte, Value: "2026-08-20T18:05:06Z"},
 				},
-				Sorts:  []driver.Sort{{Field: "uploaded_time", Desc: true}},
+				Sorts:  []driver.Sort{{Field: "uploaded_timestamp", Desc: true}},
 				Limit:  50,
 				Offset: 10,
 			},
 			wantSQL: "SELECT `id`, `data`, `fields` FROM `huatuo`.`t` WHERE `f_hostname` = ? AND " +
-				"`f_uploaded_time` >= ? ORDER BY `f_uploaded_time` DESC LIMIT ? OFFSET ?",
+				"`f_uploaded_timestamp` >= ? ORDER BY `f_uploaded_timestamp` DESC LIMIT ? OFFSET ?",
 			wantArgs: []any{"node-1", "2026-08-20 18:05:06.000000", 50, 10},
 		},
 		{
@@ -296,16 +296,14 @@ func TestBuildCountSQL(t *testing.T) {
 }
 
 func TestBuildValuesSQL(t *testing.T) {
-	kinds := columnKinds(testIndexes)
-
-	t.Run("text column guards against blanks", func(t *testing.T) {
-		sql, args, err := buildValuesSQL("huatuo", "t", "hostname", driver.Query{}, 20, kinds, time.UTC)
+	t.Run("text column preserves empty values", func(t *testing.T) {
+		sql, args, err := buildValuesSQL("huatuo", "t", "hostname", driver.Query{}, 20, time.UTC)
 		if err != nil {
 			t.Fatalf("buildValuesSQL() returned error: %v", err)
 		}
 
 		want := "SELECT DISTINCT `f_hostname` AS term FROM `huatuo`.`t` WHERE `f_hostname` IS NOT NULL " +
-			"AND `f_hostname` != '' ORDER BY term ASC LIMIT ?"
+			"ORDER BY term ASC LIMIT ?"
 		if sql != want {
 			t.Errorf("buildValuesSQL() sql =\n%s\nwant:\n%s", sql, want)
 		}
@@ -316,7 +314,7 @@ func TestBuildValuesSQL(t *testing.T) {
 
 	// Comparing a DATETIME column against '' is a type error in Doris.
 	t.Run("time column omits the blank guard", func(t *testing.T) {
-		sql, _, err := buildValuesSQL("huatuo", "t", "uploaded_time", driver.Query{}, 0, kinds, time.UTC)
+		sql, _, err := buildValuesSQL("huatuo", "t", "uploaded_timestamp", driver.Query{}, 0, time.UTC)
 		if err != nil {
 			t.Fatalf("buildValuesSQL() returned error: %v", err)
 		}
@@ -326,7 +324,7 @@ func TestBuildValuesSQL(t *testing.T) {
 	})
 
 	t.Run("negative size", func(t *testing.T) {
-		if _, _, err := buildValuesSQL("huatuo", "t", "hostname", driver.Query{}, -1, kinds, time.UTC); !errors.Is(err, driver.ErrInvalidQuery) {
+		if _, _, err := buildValuesSQL("huatuo", "t", "hostname", driver.Query{}, -1, time.UTC); !errors.Is(err, driver.ErrInvalidQuery) {
 			t.Errorf("buildValuesSQL() error = %v, want ErrInvalidQuery", err)
 		}
 	})

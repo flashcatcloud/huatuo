@@ -15,15 +15,19 @@
 package sqlite_test
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"sort"
 	"testing"
 	"time"
 
-	"huatuo-bamai/internal/storage/driver"
-	storagesqlite "huatuo-bamai/internal/storage/sqlite"
+	"github.com/ccfos/huatuo/internal/storage/driver"
+	storagesqlite "github.com/ccfos/huatuo/internal/storage/sqlite"
+	"github.com/ccfos/huatuo/internal/timeutil"
 )
 
 type backendTestEntity struct {
@@ -66,7 +70,7 @@ func seedSQLiteRecords(t *testing.T, backend *storagesqlite.Storage, records []d
 	t.Helper()
 
 	for _, rec := range records {
-		if err := backend.Save(t.Context(), rec); err != nil {
+		if err := backend.Save(t.Context(), rec, driver.SaveOptions{}); err != nil {
 			t.Errorf("backend Save(%q) returned error: %v", rec.ID, err)
 		}
 	}
@@ -105,7 +109,7 @@ func TestSQLiteBackendCRUD(t *testing.T) {
 		},
 	}
 
-	if err := backend.Save(t.Context(), record); err != nil {
+	if err := backend.Save(t.Context(), record, driver.SaveOptions{}); err != nil {
 		t.Errorf("backend Save() returned error: %v", err)
 		return
 	}
@@ -135,7 +139,51 @@ func TestSQLiteBackendCRUD(t *testing.T) {
 	}
 }
 
-func TestSQLiteBackendCreateRejectsDuplicateID(t *testing.T) {
+func TestSQLiteBackendDeleteByQuery(t *testing.T) {
+	backend := newSQLiteBackendForTest(t)
+	if backend == nil {
+		return
+	}
+	if err := backend.Init(t.Context(), "jobs", sqliteIndexes()); err != nil {
+		t.Fatalf("backend Init() error = %v", err)
+	}
+	seedSQLiteRecords(t, backend, []driver.Record{
+		{ID: "running-1", Data: []byte(`{}`), Fields: map[string]any{"status": "running"}},
+		{ID: "running-2", Data: []byte(`{}`), Fields: map[string]any{"status": "running"}},
+		{ID: "completed", Data: []byte(`{}`), Fields: map[string]any{"status": "completed"}},
+	})
+
+	filter := driver.Filter{Field: "status", Op: driver.OpEq, Value: "running"}
+	deleted, err := backend.DeleteByQuery(t.Context(), driver.DeleteQuery{
+		Filters: []driver.Filter{filter},
+		Limit:   1,
+	})
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteByQuery(limit 1) = (%d, %v), want (1, nil)", deleted, err)
+	}
+	remaining, err := backend.Count(t.Context(), driver.Query{Filters: []driver.Filter{filter}})
+	if err != nil || remaining != 1 {
+		t.Fatalf("Count() = (%d, %v), want (1, nil)", remaining, err)
+	}
+
+	deleted, err = backend.DeleteByQuery(t.Context(), driver.DeleteQuery{
+		Filters: []driver.Filter{filter},
+	})
+	if err != nil || deleted != 1 {
+		t.Fatalf("DeleteByQuery(unbounded) = (%d, %v), want (1, nil)", deleted, err)
+	}
+	if _, err := backend.DeleteByQuery(t.Context(), driver.DeleteQuery{}); !errors.Is(err, driver.ErrInvalidQuery) {
+		t.Fatalf("DeleteByQuery(empty) error = %v, want ErrInvalidQuery", err)
+	}
+	if _, err := backend.DeleteByQuery(t.Context(), driver.DeleteQuery{
+		Filters: []driver.Filter{filter},
+		Limit:   -1,
+	}); !errors.Is(err, driver.ErrInvalidQuery) {
+		t.Fatalf("DeleteByQuery(negative limit) error = %v, want ErrInvalidQuery", err)
+	}
+}
+
+func TestSQLiteBackendSaveCreateOnlyRejectsDuplicateID(t *testing.T) {
 	backend := newSQLiteBackendForTest(t)
 	if backend == nil {
 		return
@@ -145,15 +193,57 @@ func TestSQLiteBackendCreateRejectsDuplicateID(t *testing.T) {
 	}
 
 	record := driver.Record{ID: "job-duplicate", Data: []byte(`{"status":"pending"}`)}
-	if err := backend.Create(t.Context(), record); err != nil {
-		t.Fatalf("first Create() error = %v", err)
+	options := driver.SaveOptions{Mode: driver.SaveModeCreateOnly}
+	if err := backend.Save(t.Context(), record, options); err != nil {
+		t.Fatalf("first Save() error = %v", err)
 	}
-	if err := backend.Create(t.Context(), record); !errors.Is(err, driver.ErrAlreadyExists) {
-		t.Fatalf("second Create() error = %v, want ErrAlreadyExists", err)
+	if err := backend.Save(t.Context(), record, options); !errors.Is(err, driver.ErrAlreadyExists) {
+		t.Fatalf("second Save() error = %v, want ErrAlreadyExists", err)
 	}
 }
 
-// TestSQLiteBackendQuery covers SQLite backend querying: verifies equality filter, range filter, IN filter, sorting, pagination, count, and rejection of invalid pagination.
+func TestSQLiteBackendConditionalSave(t *testing.T) {
+	backend := newSQLiteBackendForTest(t)
+	if backend == nil {
+		return
+	}
+	if err := backend.Init(t.Context(), "jobs", []driver.Index{{Field: "revision"}}); err != nil {
+		t.Fatalf("backend Init() error = %v", err)
+	}
+
+	record := driver.Record{
+		ID:     "job-1",
+		Data:   []byte(`{"status":"pending"}`),
+		Fields: map[string]any{"revision": int64(1)},
+	}
+	if err := backend.Save(t.Context(), record, driver.SaveOptions{}); err != nil {
+		t.Fatalf("seed Save() error = %v", err)
+	}
+	record.Data = []byte(`{"status":"running"}`)
+	record.Fields["revision"] = int64(2)
+	options := driver.SaveOptions{
+		Mode: driver.SaveModeConditional,
+		Conditions: []driver.Filter{
+			{Field: "revision", Op: driver.OpEq, Value: int64(1)},
+		},
+	}
+	if err := backend.Save(t.Context(), record, options); err != nil {
+		t.Fatalf("conditional Save() error = %v", err)
+	}
+	if err := backend.Save(t.Context(), record, options); !errors.Is(err, driver.ErrConflict) {
+		t.Fatalf("stale Save() error = %v, want ErrConflict", err)
+	}
+
+	stored, err := backend.Get(t.Context(), record.ID)
+	if err != nil {
+		t.Fatalf("Get() error = %v", err)
+	}
+	if !bytes.Equal(stored.Data, record.Data) || stored.Fields["revision"] != json.Number("2") {
+		t.Fatalf("Get() record = %#v, want revision 2 running record", stored)
+	}
+}
+
+// TestSQLiteBackendQuery covers filtering and pagination while Count ignores pagination.
 func TestSQLiteBackendQuery(t *testing.T) {
 	backend := newSQLiteBackendForTest(t)
 	if backend == nil {
@@ -209,7 +299,7 @@ func TestSQLiteBackendQuery(t *testing.T) {
 		},
 	})
 
-	records, err := backend.Query(t.Context(), driver.Query{
+	records, err := queryRecords(t.Context(), backend, driver.Query{
 		Filters: []driver.Filter{
 			{Field: "status", Op: driver.OpEq, Value: "running"},
 			{Field: "priority", Op: driver.OpGte, Value: int64(3)},
@@ -235,17 +325,15 @@ func TestSQLiteBackendQuery(t *testing.T) {
 		Filters: []driver.Filter{
 			{Field: "status", Op: driver.OpEq, Value: "running"},
 		},
+		Limit:     -1,
+		Offset:    -1,
+		BatchSize: -1,
 	})
 	if err != nil {
 		t.Errorf("backend Count() returned error: %v", err)
 	}
 	if count != 3 {
 		t.Errorf("backend Count() = %d, want 3", count)
-	}
-
-	_, err = backend.Query(t.Context(), driver.Query{Limit: -1})
-	if err == nil {
-		t.Errorf("backend Query() error = nil for negative limit, want error")
 	}
 }
 
@@ -315,7 +403,10 @@ func TestSQLiteBackendTerms(t *testing.T) {
 	})
 
 	terms, err := backend.Values(t.Context(), "user_id", driver.Query{
-		Filters: []driver.Filter{{Field: "status", Op: driver.OpEq, Value: "running"}},
+		Filters:   []driver.Filter{{Field: "status", Op: driver.OpEq, Value: "running"}},
+		Limit:     -1,
+		Offset:    -1,
+		BatchSize: -1,
 	}, 10)
 	if err != nil {
 		t.Errorf("backend Terms() returned error: %v", err)
@@ -344,5 +435,148 @@ func TestSQLiteBackendTerms(t *testing.T) {
 	}
 	if len(limitedTerms) != 1 {
 		t.Errorf("backend Terms() limited count = %d, want 1", len(limitedTerms))
+	}
+}
+
+func TestSQLiteTimestampIndexFormat(t *testing.T) {
+	backend := newSQLiteBackendForTest(t)
+	if backend == nil {
+		t.Fatal("SQLite backend unavailable")
+	}
+	if err := backend.Init(t.Context(), "timestamps", []driver.Index{{Field: "observed_timestamp"}}); err != nil {
+		t.Fatal(err)
+	}
+	// Adjacent nanoseconds must remain distinct even within the same millisecond.
+	first := time.Date(2026, 9, 17, 8, 0, 0, 123456789, time.FixedZone("local", 8*60*60))
+	second, third := first.Add(time.Nanosecond), first.Add(2*time.Nanosecond)
+	seedSQLiteRecords(t, backend, []driver.Record{
+		{ID: "first", Data: []byte(`{}`), Fields: map[string]any{"observed_timestamp": first}},
+		{ID: "second", Data: []byte(`{}`), Fields: map[string]any{"observed_timestamp": timeutil.Timestamp{Time: second}}},
+		{ID: "third", Data: []byte(`{}`), Fields: map[string]any{"observed_timestamp": "2026-09-17T00:00:00.123456791Z"}},
+	})
+	record, err := backend.Get(t.Context(), "first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := record.Fields["observed_timestamp"]; got != "2026-09-17T00:00:00.123456789Z" {
+		t.Fatalf("stored timestamp = %v", got)
+	}
+	for _, test := range []struct {
+		name  string
+		op    driver.Op
+		value any
+		want  []string
+	}{
+		{"equal", driver.OpEq, second, []string{"second"}},
+		{"equal timestamp", driver.OpEq, timeutil.Timestamp{Time: second}, []string{"second"}},
+		{"in timestamps", driver.OpIn, []timeutil.Timestamp{{Time: first}, {Time: third}}, []string{"first", "third"}},
+		{"range timestamp", driver.OpGt, timeutil.Timestamp{Time: first}, []string{"second", "third"}},
+		{"equal formatted", driver.OpEq, "2026-09-17T00:00:00.123456790Z", []string{"second"}},
+		{"in", driver.OpIn, []time.Time{first, third}, []string{"first", "third"}},
+		{"greater", driver.OpGt, first, []string{"second", "third"}},
+		{"greater equal", driver.OpGte, second, []string{"second", "third"}},
+		{"less", driver.OpLt, second, []string{"first"}},
+		{"less equal", driver.OpLte, second, []string{"first", "second"}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			records, err := queryRecords(t.Context(), backend, driver.Query{Filters: []driver.Filter{{Field: "observed_timestamp", Op: test.op, Value: test.value}}, Sorts: []driver.Sort{{Field: "observed_timestamp"}}, Limit: 10})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(records) != len(test.want) {
+				t.Fatalf("records=%d, want %d", len(records), len(test.want))
+			}
+			for i, id := range test.want {
+				if records[i].ID != id {
+					t.Fatalf("record %d=%s, want %s", i, records[i].ID, id)
+				}
+			}
+		})
+	}
+}
+
+func queryRecords(ctx context.Context, backend driver.Backend, q driver.Query) ([]driver.Record, error) {
+	var records []driver.Record
+	err := backend.Query(ctx, q, func(batch []driver.Record) error {
+		records = append(records, batch...)
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return records, nil
+}
+
+func TestSQLiteQueryBatchesAndCleanup(t *testing.T) {
+	backend := newSQLiteBackendForTest(t)
+	if err := backend.Init(t.Context(), "batch_records", nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 17; i++ {
+		if err := backend.Save(t.Context(), driver.Record{ID: fmt.Sprintf("%02d", i), Data: []byte(`{}`)}, driver.SaveOptions{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, tc := range []struct{ limit, offset, size, want int }{
+		{11, 3, 4, 11}, {30, 3, 4, 14}, {4, 20, 4, 0}, {5, 0, 0, 5},
+	} {
+		var batches [][]driver.Record
+		q := driver.Query{Limit: tc.limit, Offset: tc.offset, BatchSize: tc.size, Sorts: []driver.Sort{{Field: "id"}}}
+		err := backend.Query(t.Context(), q, func(batch []driver.Record) error {
+			if len(batch) == 0 || len(batch) > q.ReadSize() {
+				t.Errorf("batch length=%d", len(batch))
+			}
+			batches = append(batches, batch)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for _, batch := range batches {
+			for i := range batch {
+				if want := fmt.Sprintf("%02d", tc.offset+count); batch[i].ID != want {
+					t.Fatalf("ID=%s, want %s", batch[i].ID, want)
+				}
+				count++
+			}
+		}
+		if count != tc.want {
+			t.Fatalf("count=%d, want %d", count, tc.want)
+		}
+	}
+	for _, canceled := range []bool{false, true} {
+		ctx, cancel := context.WithCancel(t.Context())
+		failure := errors.New("consumer failed")
+		calls := 0
+		err := backend.Query(ctx, driver.Query{Limit: 17, BatchSize: 2}, func([]driver.Record) error {
+			calls++
+			if canceled {
+				cancel()
+				return nil
+			}
+			return failure
+		})
+		cancel()
+		want := failure
+		if canceled {
+			want = context.Canceled
+		}
+		if !errors.Is(err, want) || calls != 1 {
+			t.Fatalf("error=%v calls=%d", err, calls)
+		}
+		// The pool has one connection; a leaked result set would block this read.
+		readCtx, stop := context.WithTimeout(t.Context(), time.Second)
+		_, err = backend.Count(readCtx, driver.Query{})
+		stop()
+		if err != nil {
+			t.Fatalf("query did not release connection: %v", err)
+		}
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	err := backend.Query(ctx, driver.Query{Limit: 20, BatchSize: 20}, func([]driver.Record) error { cancel(); return nil })
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("final partial batch cancellation: %v", err)
 	}
 }

@@ -17,6 +17,7 @@
 package doris
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -25,8 +26,8 @@ import (
 	"sync"
 	"time"
 
-	"huatuo-bamai/internal/log"
-	"huatuo-bamai/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/log"
+	"github.com/ccfos/huatuo/internal/storage/driver"
 )
 
 // Defaults chosen so a load carries a worthwhile batch without holding many
@@ -47,7 +48,7 @@ const (
 // count sane when many agents write the same table concurrently — client-side
 // batching cannot help there, since each agent only holds its own rows.
 const (
-	// GroupCommitOff gives every load its own transaction and label.
+	// GroupCommitOff gives every load its own transaction.
 	GroupCommitOff = "off_mode"
 	// GroupCommitSync waits for the shared commit, so it costs a full
 	// group_commit_interval_ms per load.
@@ -145,6 +146,9 @@ func orDefault(value, fallback int) int {
 }
 
 func (s *Storage) Init(ctx context.Context, collection string, indexes []driver.Index) error {
+	if err := validateIdentifier(s.database); err != nil {
+		return err
+	}
 	if err := validateIdentifier(collection); err != nil {
 		return err
 	}
@@ -153,7 +157,6 @@ func (s *Storage) Init(ctx context.Context, collection string, indexes []driver.
 	s.loader = newStreamLoader(s.feAddr, s.database, s.table, s.username, s.password,
 		s.maxRetries, s.groupCommit)
 
-	ctx = driver.WithContext(ctx)
 	loc, err := sessionLocation(ctx, s.db)
 	if err != nil {
 		return err
@@ -210,12 +213,28 @@ func (s *Storage) flushLoop(ctx context.Context) {
 	}
 }
 
-func (s *Storage) Save(ctx context.Context, rec driver.Record) error {
+func (s *Storage) Save(ctx context.Context, rec driver.Record, options driver.SaveOptions) error {
+	if options.Mode != driver.SaveModeUpsert || len(options.Conditions) != 0 {
+		return fmt.Errorf("%w: doris supports unconditional upserts only", driver.ErrUnsupported)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	row, size, err := s.buildRow(rec)
 	if err != nil {
 		return err
 	}
 
+	if options.WaitForVisibility {
+		// A publication marker must never outrun the windows it commits.
+		// Bypass buffering and async group commit, then verify query visibility.
+		load := *s.loader
+		load.groupCommit = GroupCommitOff
+		if err := load.load(ctx, []map[string]any{row}); err != nil {
+			return err
+		}
+		return s.waitVisible(ctx, rec)
+	}
 	s.mu.Lock()
 	s.batch = append(s.batch, row)
 	s.batchBytes += size
@@ -250,7 +269,13 @@ func (s *Storage) buildRow(rec driver.Record) (map[string]any, int, error) {
 		if err != nil {
 			return nil, 0, err
 		}
-		row[column] = driver.StringValue(value)
+		if _, indexed := s.kinds[column]; indexed {
+			if value == nil {
+				row[column] = nil
+			} else {
+				row[column] = driver.StringValue(value)
+			}
+		}
 	}
 
 	return row, len(rec.Data) + len(fieldsJSON), nil
@@ -271,7 +296,7 @@ func (s *Storage) Flush(ctx context.Context) error {
 	// Retries are exhausted by the time load returns an error, so the batch
 	// is dropped rather than retained: holding it would grow without bound
 	// while the backend stays unreachable. Say how much was lost.
-	if err := s.loader.load(driver.WithContext(ctx), batch); err != nil {
+	if err := s.loader.load(ctx, batch); err != nil {
 		return fmt.Errorf("doris backend dropped %d rows for %s.%s: %w",
 			len(batch), s.database, s.table, err)
 	}
@@ -289,7 +314,7 @@ func (s *Storage) Get(ctx context.Context, id string) (driver.Record, error) {
 		data       sql.NullString
 		fieldsJSON sql.NullString
 	)
-	err := s.db.QueryRowContext(driver.WithContext(ctx), querySQL, id).Scan(&rec.ID, &data, &fieldsJSON)
+	err := s.db.QueryRowContext(ctx, querySQL, id).Scan(&rec.ID, &data, &fieldsJSON)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return driver.Record{}, driver.ErrNotFound
@@ -307,44 +332,82 @@ func (s *Storage) Get(ctx context.Context, id string) (driver.Record, error) {
 
 func (s *Storage) Delete(ctx context.Context, id string) error {
 	deleteSQL := fmt.Sprintf("DELETE FROM %s WHERE %s = ?", qualified(s.database, s.table), quote(colID))
-	if _, err := s.db.ExecContext(driver.WithContext(ctx), deleteSQL, id); err != nil {
+	if _, err := s.db.ExecContext(ctx, deleteSQL, id); err != nil {
 		return fmt.Errorf("doris backend delete from %s: %w", s.table, err)
 	}
 	return nil
 }
 
-func (s *Storage) Query(ctx context.Context, q driver.Query) ([]driver.Record, error) {
+// DeleteByQuery is deliberately unsupported: Doris cannot provide the exact
+// bounded delete count required by the shared backend contract.
+func (s *Storage) DeleteByQuery(context.Context, driver.DeleteQuery) (int64, error) {
+	return 0, fmt.Errorf("%w: doris does not support counted query deletion", driver.ErrUnsupported)
+}
+
+func (s *Storage) Query(ctx context.Context, q driver.Query, consume func([]driver.Record) error) error {
+	if q.Limit <= 0 || q.Offset < 0 || q.BatchSize < 0 || consume == nil {
+		return fmt.Errorf("%w: positive limit, nonnegative pagination and consumer required", driver.ErrInvalidQuery)
+	}
 	querySQL, args, err := buildSelectSQL(s.database, s.table, q, s.loc)
 	if err != nil {
-		return nil, err
+		return err
 	}
-
-	rows, err := s.db.QueryContext(driver.WithContext(ctx), querySQL, args...)
+	rows, err := s.db.QueryContext(ctx, querySQL, args...)
 	if err != nil {
-		return nil, fmt.Errorf("doris backend query %s: %w", s.table, err)
+		return fmt.Errorf("doris backend query %s: %w", s.table, err)
 	}
 	defer rows.Close()
-
-	records := make([]driver.Record, 0)
+	batchSize := q.ReadSize()
+	records := make([]driver.Record, 0, batchSize)
 	for rows.Next() {
-		var (
-			rec        driver.Record
-			data       sql.NullString
-			fieldsJSON sql.NullString
-		)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		var rec driver.Record
+		var data, fieldsJSON sql.NullString
 		if err := rows.Scan(&rec.ID, &data, &fieldsJSON); err != nil {
-			return nil, fmt.Errorf("doris backend scan record from %s: %w", s.table, err)
+			return fmt.Errorf("doris backend scan %s: %w", s.table, err)
 		}
 		rec.Data = []byte(data.String)
 		if rec.Fields, err = decodeFields(fieldsJSON.String); err != nil {
-			return nil, err
+			return err
 		}
 		records = append(records, rec)
+		if len(records) == batchSize {
+			if err := consume(records); err != nil {
+				return err
+			}
+			records = make([]driver.Record, 0, batchSize)
+		}
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("doris backend iterate %s: %w", s.table, err)
+		return fmt.Errorf("doris backend iterate %s: %w", s.table, err)
 	}
-	return records, nil
+	if len(records) != 0 {
+		return consume(records)
+	}
+	return nil
+}
+
+func (s *Storage) waitVisible(ctx context.Context, expected driver.Record) error {
+	ctx, cancel := context.WithTimeout(ctx, time.Minute)
+	defer cancel()
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		rec, err := s.Get(ctx, expected.ID)
+		if err == nil && bytes.Equal(rec.Data, expected.Data) {
+			return nil
+		}
+		if err != nil && !errors.Is(err, driver.ErrNotFound) {
+			return err
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("doris record %q not query-visible: %w", expected.ID, ctx.Err())
+		case <-ticker.C:
+		}
+	}
 }
 
 func (s *Storage) Count(ctx context.Context, q driver.Query) (int64, error) {
@@ -354,19 +417,19 @@ func (s *Storage) Count(ctx context.Context, q driver.Query) (int64, error) {
 	}
 
 	var count int64
-	if err := s.db.QueryRowContext(driver.WithContext(ctx), countSQL, args...).Scan(&count); err != nil {
+	if err := s.db.QueryRowContext(ctx, countSQL, args...).Scan(&count); err != nil {
 		return 0, fmt.Errorf("doris backend count %s: %w", s.table, err)
 	}
 	return count, nil
 }
 
 func (s *Storage) Values(ctx context.Context, field string, q driver.Query, size int) ([]string, error) {
-	valuesSQL, args, err := buildValuesSQL(s.database, s.table, field, q, size, s.kinds, s.loc)
+	valuesSQL, args, err := buildValuesSQL(s.database, s.table, field, q, size, s.loc)
 	if err != nil {
 		return nil, err
 	}
 
-	rows, err := s.db.QueryContext(driver.WithContext(ctx), valuesSQL, args...)
+	rows, err := s.db.QueryContext(ctx, valuesSQL, args...)
 	if err != nil {
 		return nil, fmt.Errorf("doris backend values %s.%s: %w", s.table, field, err)
 	}

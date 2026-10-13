@@ -19,11 +19,11 @@ HUATUO 基于 eBPF 技术，对 Linux 内核中的 CPU 调度、内存子系统�
 
 相比传统的基于内核日志（dmesg/syslog）采集方案，eBPF 事件观测具备更低的数据丢失风险——不会因内核日志缓冲区满溢而丢失关键事件；同时可捕获不会写入内核日志的短暂性异常（如调度 tick 间隔过长）；并提供容器级别的事件关联信息，满足云原生场景下的精准定位需求。
 
-当前支持 12 类事件的持续观测，覆盖 CPU 调度健康状态（sched_tick、softlockup、hungtask）、内存压力（oom、memory_reclaim_events）、网络协议栈（dropwatch、tcp_retransmit、net_rx_latency、netdev_events、netdev_bonding_lacp、netdev_txqueue_timeout）以及硬件可靠性（ras）等方面。
+当前支持 12 类事件的持续观测，覆盖 CPU 调度健康状态（sched_tick、softlockup、hungtask）、内存压力（memory_oom_kill、memory_reclaim_events）、网络协议栈（dropwatch、tcp_retransmit、net_rx_latency、netdev_events、netdev_bonding_lacp、netdev_txqueue_timeout）以及硬件可靠性（ras）等方面。
 
 ## 🎯 场景
 
-**Kubernetes 容器内存故障定位**：在容器频繁 OOM 重启场景下，oom 事件同时记录被 OOM Killer 终止的进程（victim）与触发 OOM 的进程（trigger）的 memcg cgroup 指针及容器 ID，结合时序数据可快速定位内存资源争抢的根因容器，降低人工排查容器日志的时间成本。
+**Kubernetes 容器内存故障定位**：在容器频繁 OOM 重启场景下，memory_oom_kill 事件同时记录被 OOM Killer 终止的进程（victim）与触发 OOM 的进程（trigger）的 memcg cgroup 指针及容器 ID，结合时序数据可快速定位内存资源争抢的根因容器，降低人工排查容器日志的时间成本。
 
 **AI 训练集群硬件故障感知**：在 GPU 训练服务器上，ras 事件持续采集 MCE（Machine Check Exception）、EDAC 内存控制器错误和 PCIe AER（Advanced Error Reporting）错误，对错误进行严重程度分级（Corrected / UncorrectedRecoverable / UncorrectedFatal），在训练任务中断前提前感知硬件老化或单点故障，减少因硬件故障导致的训练任务损失。
 
@@ -60,7 +60,7 @@ HUATUO 基于 eBPF 技术，对 Linux 内核中的 CPU 调度、内存子系统�
 | `sched_tick` | kprobe | 调度 tick 间隔 >= 阈值（默认 10ms） | 系统卡顿、网络延迟、调度延迟 |
 | `softlockup` | kprobe | CPU 长时间无法调度（约 1 秒） | 系统软锁死、响应异常 |
 | `hungtask` | kprobe | D 状态进程任务挂起 | 瞬时批量 D 进程、IO 阻塞 |
-| `oom` | kprobe | OOM Killer 触发 | 容器/宿主机内存耗尽 |
+| `memory_oom_kill` | kprobe | OOM Killer 触发 | 容器/宿主机内存耗尽 |
 | `memory_reclaim_events` | kprobe | 容器进程直接回收时间 > 阈值（默认 900ms） | 内存压力导致业务卡顿 |
 | `ras` | tracepoint | CPU/MEM/PCIe 硬件错误 | 硬件故障感知 |
 | `dropwatch` | tracepoint | 内核网络协议栈丢包 | 协议栈丢包导致业务毛刺 |
@@ -78,16 +78,16 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 
 - **hostname**：物理机 hostname
 - **region**：物理机所在可用区
-- **uploaded_time**：数据上传时间
+- **uploaded_timestamp**：数据上传时间
 - **container_id**：如果事件关联容器，则记录的容器 ID
 - **container_hostname**：如果事件关联容器，则记录的容器 hostname
 - **container_host_namespace**：如果事件关联容器，则记录容器的 K8s 命名空间
 - **container_type**：容器类型，例如 `normal` 普通容器，`sidecar` 边车容器等
 - **container_qos**：容器 QoS 级别
-- **tracer_name**：事件名称（如 `sched_tick`、`oom` 等）
+- **tracer_name**：事件名称（如 `sched_tick`、`memory_oom_kill` 等）
 - **tracer_id**：此次的 tracing ID
-- **tracer_time**：触发 tracing 时间
-- **tracer_type**：触发类型（手动触发或自动触发）
+- **observed_timestamp**：触发 tracing 时间
+- **tracer_type**：观测类型，即时事件记录固定为 `event`
 - **tracer_data**：特定事件私有数据（详见各事件说明）
 
 ### 1. sched_tick 调度 tick 间隔
@@ -108,7 +108,7 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 
 ```json
 {
-    "uploaded_time": "2025-06-11T16:05:16.251152703+08:00",
+    "uploaded_timestamp": "2025-06-11T16:05:16.251152703+08:00",
     "hostname": "***",
     "tracer_data": {
         "tick_interval_ns": 237328905,
@@ -118,9 +118,8 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
         "cpu": 1,
         "stack": "scheduler_tick/..."
     },
-    "tracer_time": "2025-06-11 16:05:16.251 +0800",
-    "tracer_type": "auto",
-    "time": "2025-06-11 16:05:16.251 +0800",
+    "observed_timestamp": "2025-06-11T16:05:16.251+08:00",
+    "tracer_type": "event",
     "region": "***",
     "tracer_name": "sched_tick"
 }
@@ -145,8 +144,8 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 
 ```json
 {
+    "observed_timestamp": "2026-07-23T02:14:40.304775546Z",
     "tracer_data": {
-        "observed_timestamp": "2026-07-23T02:14:40.304775546Z",
         "drop_reason": "SKB_DROP_REASON_NOT_SPECIFIED",
         "source": "events",
         "comm": "kubelet",
@@ -171,7 +170,6 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
                 "dport": 49000,
                 "seq": 1009085774,
                 "ack_seq": 689410995,
-                "flags": "ACK",
                 "sk_state": "ESTABLISHED"
             }
         },
@@ -209,6 +207,7 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 
 ```json
 {
+    "observed_timestamp": "2025-06-11T00:00:00Z",
     "tracer_data": {
         "comm": "nginx",
         "pid": 2921092,
@@ -244,7 +243,9 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 - **net_namespace_inum**：网络命名空间 inum
 - **packet_len_bytes**：数据包长度（字节）
 
-### 4. oom 内存耗尽
+### 4. memory_oom_kill 内存耗尽
+
+OOM kill 追踪器现命名为 `memory_oom_kill`（此前为 `memory_oom`，更早为 `oom`），需同步更新黑名单、事件过滤器和告警查询。指标前缀现为 `huatuo_bamai_memory_oom_kill_`，替代 `huatuo_bamai_memory_oom_` 及更早的 `huatuo_bamai_oom_`，需同步更新指标仪表盘和记录规则。历史事件保留原名称，跨版本查询需匹配这三个名称；内置事件仪表盘已覆盖三者。
 
 **功能描述** 检测宿主机或容器内发生的 OOM（Out of Memory）事件，记录被 OOM Killer 终止的进程（victim）与触发 OOM 的进程（trigger）信息，以及对应容器和 memory cgroup 的详细信息，提供完整的故障快照。同时维护宿主机和各容器的 OOM 计数指标。
 
@@ -409,7 +410,6 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
         "dev": "CPU/MEM",
         "event": "MCE",
         "type": "UncorrectedRecoverable",
-        "observed_timestamp": "2025-06-11T00:00:00Z",
         "info": "{\"mcg_cpu_cap\":4096,\"banks_msr_status\":9295429630892703744,\"cpu\":2,\"socketid\":0,\"bank\":5}"
     }
 }
@@ -419,11 +419,11 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 
 ```json
 {
+    "observed_timestamp": "2025-06-11T00:00:00Z",
     "tracer_data": {
         "dev": "PCIe 0000:3b:00.0",
         "event": "AER",
         "type": "UncorrectedRecoverable",
-        "observed_timestamp": "2025-06-11T00:00:00Z",
         "info": "{\"dev_name\":\"0000:3b:00.0\",\"err_type\":\"UncorrectedRecoverable\",\"err_reason\":\"Completion Timeout\",\"tlp_header\":\"not available\"}"
     }
 }
@@ -434,7 +434,7 @@ tcp_retransmit 的使用方式、字段、分类和丢包关联请参考 [tcpsha
 - **dev**：发生错误的硬件设备（如 `CPU/MEM`、`PCIe 0000:3b:00.0`）
 - **event**：错误类型（`MCE` / `EDAC` / `NON_STANDARD` / `AER` / `MCE_THRESHOLD`）
 - **type**：错误严重程度（`Corrected` / `UncorrectedRecoverable` / `UncorrectedDeferred` / `UncorrectedFatal` / `Info`）
-- **observed_timestamp**：硬件错误发生时的 UTC 时间
+- **observed_timestamp**：顶层字段，表示用户态观测事件的 UTC 时间；`kernel_observed_timestamp` 表示内核观测事件的 UTC 时间
 - **info**：JSON 格式的详细错误信息，内容因 event 类型不同而不同
 
 ### 9. netdev_events 网络设备
@@ -525,7 +525,7 @@ HUATUO 的异常事件观测基于 eBPF 技术，在内核态以极低的性能�
 graph TB
     subgraph "Linux Kernel"
         direction TB
-        K1["kprobe 挂钩\n(sched_tick / softlockup / hungtask\n oom / memory_reclaim_events\n net_rx_latency / netdev_txqueue_timeout\n tcp_retransmit TLP，可选)"]
+        K1["kprobe 挂钩\n(sched_tick / softlockup / hungtask\n memory_oom_kill / memory_reclaim_events\n net_rx_latency / netdev_txqueue_timeout\n tcp_retransmit TLP，可选)"]
         K2["tracepoint 挂钩\n(ras: MCE / EDAC / AER / ACPI\n dropwatch: skb/kfree_skb\n tcp_retransmit:\n tcp/tcp_retransmit_skb /\n tcp/tcp_retransmit_synack)"]
         K3["netlink 订阅\n(netdev_events: RTM_NEWLINK)"]
         K4["kprobe 挂钩\n(netdev_bonding_lacp: 802.3ad)"]

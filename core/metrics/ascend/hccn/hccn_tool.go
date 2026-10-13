@@ -24,36 +24,20 @@
 package hccn
 
 import (
-	"bytes"
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ccfos/huatuo/internal/executil"
 )
 
 // hccnSemaphore limits total concurrent hccn_tool processes across all devices.
 var hccnSemaphore = make(chan struct{}, 32)
 
-const (
-	hccnTool    = "/usr/local/Ascend/driver/tools/hccn_tool"
-	outputLimit = 1024 * 1024 // 1MB cap to prevent OOM from runaway output
-)
-
-// limitedWriter caps the total bytes written to prevent memory exhaustion.
-type limitedWriter struct {
-	buf   bytes.Buffer
-	limit int
-}
-
-func (w *limitedWriter) Write(p []byte) (int, error) {
-	if w.buf.Len()+len(p) > w.limit {
-		return 0, fmt.Errorf("hccn_tool output exceeds limit (%d bytes)", w.limit)
-	}
-	return w.buf.Write(p)
-}
+const hccnTool = "/usr/local/Ascend/driver/tools/hccn_tool"
 
 func getInfoFromHccnTool(args ...string) (string, error) {
 	hccnSemaphore <- struct{}{}
@@ -62,22 +46,22 @@ func getInfoFromHccnTool(args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, hccnTool, args...)
-	cmd.Env = []string{
-		"PATH=" + os.Getenv("PATH"),
-		"LD_LIBRARY_PATH=" + os.Getenv("LD_LIBRARY_PATH"),
+	result, err := executil.Run(ctx, executil.Spec{
+		Path:            hccnTool,
+		Args:            args,
+		StopGracePeriod: time.Second,
+		MaxStdoutBytes:  4 << 10,
+		MaxStderrBytes:  4 << 10,
+		Env: []string{
+			"PATH=" + os.Getenv("PATH"),
+			"LD_LIBRARY_PATH=" + os.Getenv("LD_LIBRARY_PATH"),
+		},
+	})
+	if err != nil {
+		return "", fmt.Errorf("hccn_tool %v failed: %w; stdout=%q; stderr=%q", args, err, result.Stdout, result.Stderr)
 	}
 
-	stdout := &limitedWriter{limit: outputLimit}
-	stderr := &limitedWriter{limit: outputLimit}
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-
-	if err := cmd.Run(); err != nil {
-		return "", fmt.Errorf("hccn_tool %v failed: %w", args, err)
-	}
-
-	return stdout.buf.String(), nil
+	return string(result.Stdout), nil
 }
 
 // GetLinkStatus returns the link status ("UP" or "DOWN") for the given phyID.

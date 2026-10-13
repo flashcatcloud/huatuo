@@ -15,20 +15,24 @@
 package provider
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"path/filepath"
 	"strconv"
 	"strings"
 
-	"huatuo-bamai/internal/profiler"
-	"huatuo-bamai/internal/profiler/aggregator"
-	pcontext "huatuo-bamai/internal/profiler/context"
-	profilerexec "huatuo-bamai/internal/profiler/exec"
-	"huatuo-bamai/internal/profiler/procutil"
-	"huatuo-bamai/internal/profiler/registry"
-	"huatuo-bamai/internal/utils/executil"
-	"huatuo-bamai/pkg/profiling"
+	"github.com/ccfos/huatuo/internal/executil"
+	"github.com/ccfos/huatuo/internal/process"
+	"github.com/ccfos/huatuo/internal/profiler"
+	"github.com/ccfos/huatuo/internal/profiler/aggregator"
+	pcontext "github.com/ccfos/huatuo/internal/profiler/context"
+	profilerexec "github.com/ccfos/huatuo/internal/profiler/exec"
+	profilerprocess "github.com/ccfos/huatuo/internal/profiler/process"
+	"github.com/ccfos/huatuo/internal/profiler/registry"
+	"github.com/ccfos/huatuo/internal/profiler/toolpath"
+	"github.com/ccfos/huatuo/pkg/profiling"
 )
 
 type pythonCPUProfiler struct {
@@ -57,7 +61,7 @@ func (p *pythonCPUProfiler) NewAggregator(pctx *pcontext.ProfilerContext) (aggre
 }
 
 func (p *pythonCPUProfiler) Start(pctx *pcontext.ProfilerContext) error {
-	if err := validatePythonToolPath(pctx.ToolPath); err != nil {
+	if err := toolpath.Validate(profiling.LanguagePython, pctx.ToolDir); err != nil {
 		return err
 	}
 	if err := validatePythonAggregationWindow(pctx.Duration, pctx.AggrInterval); err != nil {
@@ -66,7 +70,7 @@ func (p *pythonCPUProfiler) Start(pctx *pcontext.ProfilerContext) error {
 
 	p.duration = pctx.Duration
 	p.freq = pctx.Freq
-	p.toolPath = pctx.ToolPath
+	p.toolPath = pctx.ToolDir
 
 	pids, err := resolvePythonPids(pctx)
 	if err != nil {
@@ -83,7 +87,7 @@ func (p *pythonCPUProfiler) Start(pctx *pcontext.ProfilerContext) error {
 			return err
 		}
 	}
-	pids, err = pythonRootPids(pids, procutil.ParentPID)
+	pids, err = pythonRootPids(pids, process.PPID)
 	if err != nil {
 		return err
 	}
@@ -97,7 +101,42 @@ func (p *pythonCPUProfiler) Start(pctx *pcontext.ProfilerContext) error {
 }
 
 func (p *pythonCPUProfiler) ReadDataLoop(ctx context.Context, enqueue func(any)) error {
-	return runPySpyAndEmit(ctx, p.duration, p.freq, p.toolPath, p.pids, enqueue)
+	cmdResults := runPySpy(ctx, p.pids, p.duration, p.freq, p.toolPath)
+
+	var errorMessages []string
+
+	for i := range cmdResults {
+		cmdRes := cmdResults[i]
+		targetPid := cmdRes.PID
+
+		if !cmdRes.Succeeded() {
+			errorMessages = append(errorMessages,
+				fmt.Sprintf(
+					"PID[%d] sampling failed: %v, diagnostics: %q",
+					targetPid,
+					cmdRes.Err,
+					string(cmdRes.Diagnostics),
+				))
+
+			continue
+		}
+
+		if len(bytes.TrimSpace(cmdRes.Output)) == 0 {
+			errorMessages = append(errorMessages,
+				fmt.Sprintf("PID[%d] sampling failed: no samples collected", targetPid))
+			continue
+		}
+		enqueue(profiler.SampleOutput{
+			PID:    targetPid,
+			Output: string(cmdRes.Output),
+		})
+	}
+
+	if len(errorMessages) > 0 {
+		return fmt.Errorf("sampling failed:\n%s", strings.Join(errorMessages, "\n"))
+	}
+
+	return nil
 }
 
 func (p *pythonCPUProfiler) Stop(_ *pcontext.ProfilerContext) error {
@@ -109,7 +148,10 @@ func resolvePythonPids(pctx *pcontext.ProfilerContext) ([]int, error) {
 		return pctx.PIDs, nil
 	}
 
-	pids, err := procutil.GetPidsFromContainer(pctx.ExecPath, "python", pctx.ContainerID)
+	pids, err := profilerprocess.ContainerRootPIDs(pctx.ContainerID, profilerprocess.ExecutableFilter{
+		ExecutablePrefix: "python",
+		ExecutablePath:   pctx.ExecPath,
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -121,55 +163,30 @@ func resolvePythonPids(pctx *pcontext.ProfilerContext) ([]int, error) {
 	return pids, nil
 }
 
-func runPySpyAndEmit(ctx context.Context, dur, freq int, toolPath string, pids []int, enqueue func(any)) error {
-	cmdResults := runPySpy(ctx, pids, dur, freq, toolPath)
-
-	var errorMessages []string
-
-	for i := range cmdResults {
-		cmdRes := &cmdResults[i]
-		targetPid := cmdRes.Pid
-
-		if !cmdRes.Success {
-			errorMessages = append(errorMessages,
-				fmt.Sprintf("PID[%d] sampling failed: %v, stderr: %q", targetPid, cmdRes.CmdErr, string(cmdRes.Stderr)))
-
-			continue
-		}
-
-		if len(cmdRes.Stdout) > 0 {
-			enqueue(profiler.SampleOutput{
-				PID:    targetPid,
-				Output: string(cmdRes.Stdout),
-			})
-		}
-	}
-
-	if len(errorMessages) > 0 {
-		return fmt.Errorf("sampling failed:\n%s", strings.Join(errorMessages, "\n"))
-	}
-
-	return nil
-}
-
-func runPySpy(ctx context.Context, pids []int, dur, freq int, pyspyPath string) []executil.CmdResult {
+func runPySpy(
+	ctx context.Context,
+	pids []int,
+	dur int,
+	freq int,
+	pyspyPath string,
+) []*profilerexec.Result {
 	pyspyBin := filepath.Join(pyspyPath, "py-spy")
 	durStr := strconv.Itoa(dur)
 	freqStr := strconv.Itoa(freq)
 
-	return profilerexec.ExecCmds(ctx, pids, pyspyBin, func(pid int) []string {
-		return buildPySpyArgs(pid, durStr, freqStr)
-	})
+	return profilerexec.RunWithMemfd(ctx, pids, pyspyBin, func(pid int, outputPath string) []string {
+		return buildPySpyArgs(pid, durStr, freqStr, outputPath)
+	}, executil.WithStdout(io.Discard))
 }
 
-func buildPySpyArgs(pid int, duration, frequency string) []string {
+func buildPySpyArgs(pid int, duration, frequency, outputPath string) []string {
 	return []string{
 		"record",
 		"-d", duration,
 		"-f", "raw",
 		"-r", frequency,
 		"--subprocesses",
-		"-o", "/dev/stdout",
+		"-o", outputPath,
 		"-p", strconv.Itoa(pid),
 	}
 }

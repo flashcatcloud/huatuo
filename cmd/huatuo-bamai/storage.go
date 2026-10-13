@@ -16,88 +16,165 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
-	"huatuo-bamai/cmd/huatuo-bamai/config"
-	"huatuo-bamai/internal/log"
-	"huatuo-bamai/internal/profiler"
-	"huatuo-bamai/internal/storage"
-	"huatuo-bamai/internal/storage/driver"
-	"huatuo-bamai/internal/strutil"
-	"huatuo-bamai/pkg/tracing"
+	"github.com/ccfos/huatuo/cmd/huatuo-bamai/config"
+	"github.com/ccfos/huatuo/internal/document"
+	"github.com/ccfos/huatuo/internal/log"
+	"github.com/ccfos/huatuo/internal/profiling/publication"
+	"github.com/ccfos/huatuo/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/strutil"
+	"github.com/ccfos/huatuo/internal/tracing"
+	profilingstore "github.com/ccfos/huatuo/pkg/profiling/store"
+	tracingstore "github.com/ccfos/huatuo/pkg/tracing/store"
 )
 
 func setupStorage(d *Daemon) (func(context.Context) error, error) {
+	var (
+		tracingStore     *tracingstore.Store
+		profileStore     *profilingstore.Store
+		publicationStore *publication.Store
+		err              error
+	)
+
 	if d.opts.DisableStorage {
 		log.Infof("storage backends disabled by --disable-storage")
-		return nil, nil
+		tracingStore, err = tracingstore.NewFromConfig(
+			context.Background(),
+			tracingstore.Config{},
+		)
+	} else {
+		tracingStore, profileStore, publicationStore, err = initStorage(config.Get())
 	}
 
-	return nil, initStorage(d.opts.Region, config.Get())
+	if err != nil {
+		return nil, err
+	}
+	if err := tracing.EnableDocumentWriter(
+		tracingStore,
+		document.New(d.opts.Region),
+	); err != nil {
+		return nil, errors.Join(
+			err,
+			closeStores(context.Background(), tracingStore, profileStore, publicationStore),
+		)
+	}
+	d.tracingStore = tracingStore
+	d.profileStore = profileStore
+	d.publications = publicationStore
+	return func(ctx context.Context) error {
+		tracing.DisableDocumentWriter()
+		return closeStores(ctx, tracingStore, profileStore, publicationStore)
+	}, nil
 }
 
-func initStorage(storageRegion string, cfg *config.Config) error {
-	// Every queryable backend serves all three document roles; localfile is
-	// append-only and therefore receives tracing metadata only. Configuring
-	// more than one backend fans writes out to all of them.
-	backendConfigs := make([]*driver.Config, 0, 2)
+func initStorage(
+	cfg *config.Config,
+) (
+	tracingStore *tracingstore.Store,
+	profileStore *profilingstore.Store,
+	publicationStore *publication.Store,
+	returnedErr error,
+) {
+	defer func() {
+		if returnedErr != nil {
+			returnedErr = errors.Join(
+				returnedErr,
+				closeStores(
+					context.Background(),
+					tracingStore,
+					profileStore,
+					publicationStore,
+				),
+			)
+		}
+	}()
+
+	tracingConfig := tracingstore.Config{}
+	if cfg.Storage.Doris.Enabled() {
+		tracingConfig.Backend = cfg.Storage.Doris.DriverConfig()
+	}
 	if cfg.Storage.Elasticsearch.Enabled() {
-		backendConfigs = append(backendConfigs, &driver.Config{
+		tracingConfig.Elasticsearch = &tracingstore.ElasticsearchConfig{
+			Addresses: strutil.SplitCommaList(cfg.Storage.Elasticsearch.Address),
+			Username:  cfg.Storage.Elasticsearch.Username,
+			Password:  cfg.Storage.Elasticsearch.Password,
+			Index:     cfg.Storage.Elasticsearch.Index,
+		}
+	}
+	if cfg.Storage.LocalFile.Path != "" {
+		tracingConfig.LocalFile = &tracingstore.LocalFileConfig{
+			Path:            cfg.Storage.LocalFile.Path,
+			RotationSizeMiB: cfg.Storage.LocalFile.RotationSizeMiB,
+			MaxRotatedFiles: cfg.Storage.LocalFile.MaxRotatedFiles,
+		}
+	}
+	initializedTracingStore, err := tracingstore.NewFromConfig(
+		context.Background(),
+		tracingConfig,
+	)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	tracingStore = initializedTracingStore
+
+	if storeConfig := profileStorageConfig(cfg); storeConfig != nil {
+		initializedProfileStore, err := profilingstore.NewWithBackendConfig(context.Background(), storeConfig)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("new profiling document store (%s): %w", storeConfig.Driver, err)
+		}
+		profileStore = initializedProfileStore
+		publicationStore, err = publication.NewFromConfig(context.Background(), storeConfig)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+	}
+
+	return tracingStore, profileStore, publicationStore, nil
+}
+
+func closeStores(
+	ctx context.Context,
+	tracingStore *tracingstore.Store,
+	profileStore *profilingstore.Store,
+	publicationStore *publication.Store,
+) error {
+	var errs []error
+	if tracingStore != nil {
+		errs = append(errs, wrapCloseError("tracing store", tracingStore.Close(ctx)))
+	}
+	if profileStore != nil {
+		errs = append(errs, wrapCloseError("profiling store", profileStore.Close(ctx)))
+	}
+	if publicationStore != nil {
+		errs = append(
+			errs,
+			wrapCloseError("profiling publication store", publicationStore.Close(ctx)),
+		)
+	}
+	return errors.Join(errs...)
+}
+
+func wrapCloseError(name string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("close %s: %w", name, err)
+}
+
+func profileStorageConfig(cfg *config.Config) *driver.Config {
+	if cfg.Storage.Doris.Enabled() {
+		return cfg.Storage.Doris.DriverConfig()
+	}
+	if cfg.Storage.Elasticsearch.Enabled() {
+		return &driver.Config{
 			Driver:      "elasticsearch",
 			ESAddresses: strutil.SplitCommaList(cfg.Storage.Elasticsearch.Address),
 			ESUsername:  cfg.Storage.Elasticsearch.Username,
 			ESPassword:  cfg.Storage.Elasticsearch.Password,
 			ESIndex:     cfg.Storage.Elasticsearch.Index,
-		})
-	}
-	if cfg.Storage.Doris.Enabled() {
-		backendConfigs = append(backendConfigs, cfg.Storage.Doris.DriverConfig())
-	}
-
-	tracingMetadataStores := make([]*storage.Store[*tracing.Document], 0, len(backendConfigs)+1)
-	taskStores := make([]*storage.Store[*tracing.Document], 0, len(backendConfigs))
-	profileStores := make([]*storage.Store[*tracing.Document], 0, len(backendConfigs))
-
-	for _, backendConfig := range backendConfigs {
-		documentStore, err := storage.NewFromConfig[*tracing.Document](context.Background(), backendConfig,
-			tracing.DocumentCollection, tracing.DocumentStoreMapper{})
-		if err != nil {
-			return fmt.Errorf("new tracing document store (%s): %w", backendConfig.Driver, err)
 		}
-		tracingMetadataStores = append(tracingMetadataStores, documentStore)
-		taskStores = append(taskStores, documentStore)
-
-		profileStore, err := storage.NewFromConfig[*tracing.Document](context.Background(), backendConfig,
-			profiler.MetadataCollection, tracing.ProfileDocumentStoreMapper{})
-		if err != nil {
-			return fmt.Errorf("new profiling document store (%s): %w", backendConfig.Driver, err)
-		}
-		profileStores = append(profileStores, profileStore)
 	}
-
-	if cfg.Storage.LocalFile.Path != "" {
-		localFileStore, err := storage.NewFromConfig[*tracing.Document](context.Background(), &driver.Config{
-			Driver:                "localfile",
-			LocalFilePath:         cfg.Storage.LocalFile.Path,
-			LocalFileMaxRotation:  cfg.Storage.LocalFile.MaxRotatedFiles,
-			LocalFileRotationSize: cfg.Storage.LocalFile.RotationSizeMiB,
-		}, tracing.DocumentCollection, tracing.DocumentStoreMapper{})
-		if err != nil {
-			return fmt.Errorf("new tracing document store (localfile): %w", err)
-		}
-		tracingMetadataStores = append(tracingMetadataStores, localFileStore)
-	}
-
-	options := tracing.DocumentOptions{Region: storageRegion}
-	if len(tracingMetadataStores) > 0 {
-		tracing.SetTracingStore(tracingMetadataStores, options)
-	}
-	if len(taskStores) > 0 {
-		tracing.SetTaskStore(taskStores, options)
-	}
-	if len(profileStores) > 0 {
-		tracing.SetProfileStore(profileStores, options)
-	}
-
 	return nil
 }

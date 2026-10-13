@@ -89,7 +89,7 @@
           },
           "format": "time_series",
           "rawQuery": true,
-          "rawSql": "SELECT\n  $__timeGroupAlias(f_uploaded_time, $__interval),\n  COUNT(*) AS samples\nFROM huatuo_bamai.profiling_metadata\nWHERE $__timeFilter(f_uploaded_time)\n  AND f_hostname = ${hostname:sqlstring}\n  AND f_container_hostname = ''\n  AND f_tracer_data_flamedata_profile_type = ${type:sqlstring}\nGROUP BY 1\nORDER BY 1"
+          "rawSql": "SELECT\n  $__timeGroupAlias(f_uploaded_timestamp, $__interval),\n  COUNT(*) AS samples\nFROM huatuo_bamai.profiling_metadata\nWHERE $__timeFilter(f_uploaded_timestamp)\n  AND f_hostname = ${hostname:sqlstring}\n  AND f_container_hostname IS NULL\n  AND f_profile_data_profile_type = ${type:sqlstring}\nGROUP BY 1\nORDER BY 1"
         }
       ],
       "title": "profile samples",
@@ -148,11 +148,11 @@
           "type": "mysql",
           "uid": "huatuo-bamai-doris"
         },
-        "definition": "SELECT DISTINCT f_hostname FROM huatuo_bamai.profiling_metadata WHERE f_container_hostname = '' AND f_hostname != '' AND f_tracer_data_flamedata_profile_type = ${type:sqlstring} ORDER BY 1",
+        "definition": "SELECT DISTINCT f_hostname FROM huatuo_bamai.profiling_metadata WHERE f_container_hostname IS NULL AND f_hostname != '' AND f_profile_data_profile_type = ${type:sqlstring} ORDER BY 1",
         "description": "Selects host-level profiles.",
         "label": "hostname",
         "name": "hostname",
-        "query": "SELECT DISTINCT f_hostname FROM huatuo_bamai.profiling_metadata WHERE f_container_hostname = '' AND f_hostname != '' AND f_tracer_data_flamedata_profile_type = ${type:sqlstring} ORDER BY 1",
+        "query": "SELECT DISTINCT f_hostname FROM huatuo_bamai.profiling_metadata WHERE f_container_hostname IS NULL AND f_hostname != '' AND f_profile_data_profile_type = ${type:sqlstring} ORDER BY 1",
         "refresh": 1,
         "regex": "",
         "type": "query",

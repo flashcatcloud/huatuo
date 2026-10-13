@@ -21,22 +21,24 @@ import (
 	"testing"
 	"time"
 
-	"huatuo-bamai/pkg/tracing"
+	internalconfig "github.com/ccfos/huatuo/internal/config"
 )
 
 func TestRunPerfCommand(t *testing.T) {
-	originalTaskBinDir := tracing.TaskBinDir
+	originalCoreBinDir := internalconfig.CoreBinDir
 	t.Cleanup(func() {
-		tracing.TaskBinDir = originalTaskBinDir
+		internalconfig.CoreBinDir = originalCoreBinDir
 	})
 
 	tests := []struct {
-		name        string
-		script      string
-		request     perfRequest
-		wantOutput  []string
-		wantError   string
-		wantMissing string
+		name             string
+		script           string
+		request          perfRequest
+		wantOutput       []string
+		wantOutputBytes  int
+		wantError        string
+		wantMissing      string
+		wantErrorMissing string
 	}{
 		{
 			name:   "system wide",
@@ -62,6 +64,19 @@ func TestRunPerfCommand(t *testing.T) {
 			},
 		},
 		{
+			name: "complete output exceeds default capture limit",
+			script: `#!/bin/sh
+printf 'first\n'
+head -c 65536 /dev/zero
+printf 'last\n'
+`,
+			request: perfRequest{
+				duration: time.Second,
+			},
+			wantOutput:      []string{"first", "last"},
+			wantOutputBytes: 65536 + len("first\nlast\n"),
+		},
+		{
 			name: "empty output",
 			script: `#!/bin/sh
 exit 0
@@ -72,31 +87,48 @@ exit 0
 			wantError: "run system-wide perf: empty output",
 		},
 		{
-			name: "failed command truncates diagnostics",
+			name: "failed command keeps stderr tail",
 			script: `#!/bin/sh
-head -c 5000 /dev/zero | tr '\000' x
+printf 'stderr-start\n' >&2
+head -c 5000 /dev/zero | tr '\000' x >&2
+printf 'stderr-tail\n' >&2
 exit 2
 `,
 			request: perfRequest{
 				duration:    time.Second,
 				containerID: "0123456789ab",
 			},
-			wantError: "(truncated)",
+			wantError: "output=\"" + strings.Repeat("x", (4<<10)-len("stderr-tail\n")) +
+				"stderr-tail\"",
+			wantErrorMissing: "(truncated)",
+		},
+		{
+			name: "failed command uses stderr diagnostics",
+			script: `#!/bin/sh
+printf 'partial result'
+printf 'perf failed' >&2
+exit 2
+`,
+			request: perfRequest{
+				duration: time.Second,
+			},
+			wantError:        "perf failed",
+			wantErrorMissing: "partial result",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			taskBinDir := t.TempDir()
-			tracing.TaskBinDir = taskBinDir
+			coreBinDir := t.TempDir()
+			internalconfig.CoreBinDir = coreBinDir
 			if err := os.WriteFile(
-				filepath.Join(taskBinDir, "perf"),
+				filepath.Join(coreBinDir, "perf"),
 				[]byte(tt.script),
 				0o600,
 			); err != nil {
 				t.Fatalf("os.WriteFile() error = %v", err)
 			}
-			if err := os.Chmod(filepath.Join(taskBinDir, "perf"), 0o700); err != nil {
+			if err := os.Chmod(filepath.Join(coreBinDir, "perf"), 0o700); err != nil {
 				t.Fatalf("os.Chmod() error = %v", err)
 			}
 
@@ -105,6 +137,14 @@ exit 2
 				if err == nil || !strings.Contains(err.Error(), tt.wantError) {
 					t.Fatalf("runPerfCommand() error = %v, want contain %q", err, tt.wantError)
 				}
+				if tt.wantErrorMissing != "" &&
+					strings.Contains(err.Error(), tt.wantErrorMissing) {
+					t.Fatalf(
+						"runPerfCommand() error = %v, want exclude %q",
+						err,
+						tt.wantErrorMissing,
+					)
+				}
 				return
 			}
 			if err != nil {
@@ -112,6 +152,9 @@ exit 2
 			}
 
 			actual := string(output)
+			if tt.wantOutputBytes != 0 && len(output) != tt.wantOutputBytes {
+				t.Errorf("runPerfCommand() output length = %d, want %d", len(output), tt.wantOutputBytes)
+			}
 			for _, expected := range tt.wantOutput {
 				if !strings.Contains(actual, expected+"\n") {
 					t.Errorf("runPerfCommand() output = %q, want contain %q", actual, expected)

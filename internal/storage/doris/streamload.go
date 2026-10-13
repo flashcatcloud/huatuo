@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"huatuo-bamai/internal/log"
+	"github.com/ccfos/huatuo/internal/log"
 )
 
 const (

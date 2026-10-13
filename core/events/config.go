@@ -18,9 +18,10 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync/atomic"
 
-	"huatuo-bamai/internal/matcher"
+	"github.com/ccfos/huatuo/internal/matcher"
 )
 
 // Config holds event tracing configuration.
@@ -52,6 +53,7 @@ type Config struct {
 	TCPRetransmit struct {
 		Filter             string `default:""`
 		EnableTLP          bool   `default:"false"`
+		EnableDropwatch    bool   `default:"false"`
 		MaxEventsPerSecond uint64 `default:"100"`
 	}
 
@@ -61,6 +63,10 @@ type Config struct {
 
 	Ras struct {
 		MceThrBackoff int64 `default:"1800"`
+	}
+
+	MthreadsGPU struct {
+		MthreadsXidLevel MthreadsXidLevel `default:""`
 	}
 
 	IssuesList [][]string
@@ -90,6 +96,12 @@ func (c *Config) Validate() error {
 	if err := matcher.ValidateClassifications(c.IssuesList); err != nil {
 		return fmt.Errorf("validating issues list: %w", err)
 	}
+	if level := c.MthreadsGPU.MthreadsXidLevel; level != "" &&
+		level != mthreadsXidLevelNotify &&
+		level != mthreadsXidLevelWarning &&
+		level != mthreadsXidLevelFatal {
+		return fmt.Errorf("mthreads_xid report level %q invalid", level)
+	}
 
 	return nil
 }
@@ -109,4 +121,12 @@ func (c *Config) Clone() *Config {
 		dst.IssuesList[i] = slices.Clone(c.IssuesList[i])
 	}
 	return &dst
+}
+
+func effectiveTCPRetransmitFilter(config *Config) string {
+	filter := strings.TrimSpace(config.TCPRetransmit.Filter)
+	if filter == "" && config.TCPRetransmit.EnableDropwatch {
+		return "tcp"
+	}
+	return filter
 }
