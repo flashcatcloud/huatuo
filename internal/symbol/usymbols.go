@@ -15,7 +15,9 @@
 package symbol
 
 import (
+	"context"
 	"debug/elf"
+	"debug/gosym"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -28,14 +30,17 @@ import (
 )
 
 type executableCache struct {
-	sections sections
-	symbols  elfSymbolCache
-	typ      elf.Type
+	sections   sections
+	symbols    elfSymbolCache
+	typ        elf.Type
+	loadOffset uint64 // ELF virtual address corresponding to file offset zero
 }
 
 type elfSymbolCache struct {
-	state        *elfSymbolParseState
-	namesByELFPC map[uint64]string
+	state         *elfSymbolParseState
+	namesByELFPC  map[uint64]string
+	goTable       *gosym.Table
+	goTableLoaded bool
 }
 
 type processELF struct {
@@ -164,7 +169,7 @@ func (r *UsymResolver) resolveAddrs(pid uint32, addrs []uint64) []string {
 			if err = r.loadProcMaps(pid); err == nil {
 				if m := r.procmaps[pid].find(addr); m != nil && m.Pathname == module {
 					baseAddr := uint64(m.StartAddr) - uint64(m.Offset)
-					addPendingELFPC(groups, path, &cache.symbols, addr-baseAddr, index, failFrame("elf-no-sym", ""))
+					addPendingELFPC(groups, path, &cache.symbols, addr-baseAddr+cache.loadOffset, index, failFrame("elf-no-sym", ""))
 					continue
 				}
 			}
@@ -276,6 +281,29 @@ func (r *UsymResolver) resolveELFPCs(path string, cache *elfSymbolCache, pcs []u
 			cache.namesByELFPC[sym.Addr] = sym.Name
 		}
 	}
+	// PCs have already been relocated to ELF addresses for both PIE and libraries.
+	// Keep ELF matches authoritative; Go metadata only fills unresolved frames.
+	missing := unresolvedELFPCs(pcs, result)
+	if len(missing) != 0 {
+		if !cache.goTableLoaded {
+			cache.goTableLoaded = true
+			var goErr error
+			cache.goTable, goErr = ReadGoTable(context.Background(), f)
+			if goErr != nil {
+				log.Debugf("symbol: read Go metadata for %q: %v", path, goErr)
+			}
+		}
+		if cache.goTable != nil {
+			for _, pc := range missing {
+				if fn := cache.goTable.PCToFunc(pc); fn != nil {
+					result[pc] = fn.Name
+					if uint64(len(cache.namesByELFPC)) < r.elfSymbolLimits.MaxSymbolAndCacheCount {
+						cache.namesByELFPC[pc] = fn.Name
+					}
+				}
+			}
+		}
+	}
 	return result, err
 }
 
@@ -336,6 +364,15 @@ func (r *UsymResolver) loadElfCaches(pid uint32) (*executableCache, error) {
 		sections: secs,
 		typ:      f.Type,
 		symbols:  elfSymbolCache{state: newELFSymbolParseState(r.elfSymbolLimits)},
+	}
+	// Go PIEs can start their PT_LOAD segments at a non-zero virtual address.
+	// /proc maps offsets are file offsets, so subtracting the mapping base
+	// alone does not recover the link-time PC expected by either symbol table.
+	for _, prog := range f.Progs {
+		if prog.Type == elf.PT_LOAD && prog.Vaddr >= prog.Off {
+			cache.loadOffset = prog.Vaddr - prog.Off
+			break
+		}
 	}
 	r.exeCache[key] = cache
 	r.processes[pid] = processELF{cacheKey: key, path: path}
