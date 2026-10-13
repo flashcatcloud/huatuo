@@ -92,6 +92,9 @@ func initStorage(
 	}()
 
 	tracingConfig := tracingstore.Config{}
+	if cfg.Storage.Doris.Enabled() {
+		tracingConfig.Backend = cfg.Storage.Doris.DriverConfig()
+	}
 	if cfg.Storage.Elasticsearch.Enabled() {
 		tracingConfig.Elasticsearch = &tracingstore.ElasticsearchConfig{
 			Addresses: strutil.SplitCommaList(cfg.Storage.Elasticsearch.Address),
@@ -116,25 +119,10 @@ func initStorage(
 	}
 	tracingStore = initializedTracingStore
 
-	if cfg.Storage.Elasticsearch.Enabled() {
-		storeConfig := &driver.Config{
-			Driver:      "elasticsearch",
-			ESAddresses: strutil.SplitCommaList(cfg.Storage.Elasticsearch.Address),
-			ESUsername:  cfg.Storage.Elasticsearch.Username,
-			ESPassword:  cfg.Storage.Elasticsearch.Password,
-			ESIndex:     cfg.Storage.Elasticsearch.Index,
-		}
-		initializedProfileStore, err := profilingstore.NewFromConfig(
-			context.Background(),
-			profilingstore.Config{
-				Addresses: storeConfig.ESAddresses,
-				Username:  storeConfig.ESUsername,
-				Password:  storeConfig.ESPassword,
-				Index:     storeConfig.ESIndex,
-			},
-		)
+	if storeConfig := profileStorageConfig(cfg); storeConfig != nil {
+		initializedProfileStore, err := profilingstore.NewWithBackendConfig(context.Background(), storeConfig)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("new profiling document store (elasticsearch): %w", err)
+			return nil, nil, nil, fmt.Errorf("new profiling document store (%s): %w", storeConfig.Driver, err)
 		}
 		profileStore = initializedProfileStore
 		publicationStore, err = publication.NewFromConfig(context.Background(), storeConfig)
@@ -173,4 +161,20 @@ func wrapCloseError(name string, err error) error {
 		return nil
 	}
 	return fmt.Errorf("close %s: %w", name, err)
+}
+
+func profileStorageConfig(cfg *config.Config) *driver.Config {
+	if cfg.Storage.Doris.Enabled() {
+		return cfg.Storage.Doris.DriverConfig()
+	}
+	if cfg.Storage.Elasticsearch.Enabled() {
+		return &driver.Config{
+			Driver:      "elasticsearch",
+			ESAddresses: strutil.SplitCommaList(cfg.Storage.Elasticsearch.Address),
+			ESUsername:  cfg.Storage.Elasticsearch.Username,
+			ESPassword:  cfg.Storage.Elasticsearch.Password,
+			ESIndex:     cfg.Storage.Elasticsearch.Index,
+		}
+	}
+	return nil
 }

@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/ccfos/huatuo/cmd/huatuo-apiserver/config"
 	"github.com/ccfos/huatuo/internal/log"
 	"github.com/ccfos/huatuo/internal/profiling/publication"
 	profilequery "github.com/ccfos/huatuo/internal/profiling/query"
@@ -28,20 +29,13 @@ import (
 )
 
 func setupProfileQueryService(ctx context.Context, d *Daemon) (func(context.Context) error, error) {
-	if !d.opts.Config.Elasticsearch.Enabled() {
+	storageConfig := profileStorageConfig(d.opts.Config)
+	if storageConfig == nil {
 		log.Info("profile storage disabled")
 		return nil, nil
 	}
 
-	profileStorage, err := profilingstore.NewFromConfig(
-		ctx,
-		profilingstore.Config{
-			Addresses: strutil.SplitCommaList(d.opts.Config.Elasticsearch.Address),
-			Username:  d.opts.Config.Elasticsearch.Username,
-			Password:  d.opts.Config.Elasticsearch.Password,
-			Index:     d.opts.Config.Elasticsearch.Index,
-		},
-	)
+	profileStorage, err := profilingstore.NewWithBackendConfig(ctx, storageConfig)
 	if err != nil {
 		return nil, fmt.Errorf("initialize profile storage: %w", err)
 	}
@@ -50,13 +44,7 @@ func setupProfileQueryService(ctx context.Context, d *Daemon) (func(context.Cont
 		_ = profileStorage.Close(ctx)
 		return nil, err
 	}
-	publicationStore, err := publication.NewFromConfig(ctx, &driver.Config{
-		Driver:      "elasticsearch",
-		ESAddresses: strutil.SplitCommaList(d.opts.Config.Elasticsearch.Address),
-		ESUsername:  d.opts.Config.Elasticsearch.Username,
-		ESPassword:  d.opts.Config.Elasticsearch.Password,
-		ESIndex:     d.opts.Config.Elasticsearch.Index,
-	})
+	publicationStore, err := publication.NewFromConfig(ctx, storageConfig)
 	if err != nil {
 		_ = profileStorage.Close(ctx)
 		return nil, fmt.Errorf("initialize profiling publication Store: %w", err)
@@ -68,4 +56,20 @@ func setupProfileQueryService(ctx context.Context, d *Daemon) (func(context.Cont
 	return func(ctx context.Context) error {
 		return errors.Join(profileStorage.Close(ctx), publicationStore.Close(ctx))
 	}, nil
+}
+
+func profileStorageConfig(cfg *config.Config) *driver.Config {
+	if cfg.Doris.Enabled() {
+		return cfg.Doris.DriverConfig()
+	}
+	if cfg.Elasticsearch.Enabled() {
+		return &driver.Config{
+			Driver:      "elasticsearch",
+			ESAddresses: strutil.SplitCommaList(cfg.Elasticsearch.Address),
+			ESUsername:  cfg.Elasticsearch.Username,
+			ESPassword:  cfg.Elasticsearch.Password,
+			ESIndex:     cfg.Elasticsearch.Index,
+		}
+	}
+	return nil
 }

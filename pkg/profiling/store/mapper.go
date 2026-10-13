@@ -55,7 +55,7 @@ func (mapper) Fields(document *Document) (map[string]any, error) {
 	if err := document.validate(); err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	fields := map[string]any{
 		types.DocumentFieldHostname:               document.Hostname,
 		types.DocumentFieldRegion:                 document.Region,
 		types.DocumentFieldUploadedTimestamp:      document.UploadedTimestamp,
@@ -69,7 +69,11 @@ func (mapper) Fields(document *Document) (map[string]any, error) {
 		types.DocumentFieldTracerID:               document.TracerID,
 		types.DocumentFieldTracerType:             document.TracerRunType,
 		fieldProfileType:                          document.ProfileData.ProfileType,
-	}, nil
+	}
+	if document.ContainerHostname == "" {
+		delete(fields, types.DocumentFieldContainerHostname)
+	}
+	return fields, nil
 }
 
 func (mapper) Indexes() []driver.Index {
@@ -77,8 +81,8 @@ func (mapper) Indexes() []driver.Index {
 		{Field: types.DocumentFieldTracerID},
 		{Field: types.DocumentFieldHostname},
 		{Field: types.DocumentFieldRegion},
-		{Field: types.DocumentFieldUploadedTimestamp},
-		{Field: types.DocumentFieldStartedTimestamp},
+		{Field: types.DocumentFieldUploadedTimestamp, Kind: driver.KindTime},
+		{Field: types.DocumentFieldStartedTimestamp, Kind: driver.KindTime},
 		{Field: types.DocumentFieldContainerID},
 		{Field: types.DocumentFieldContainerHostname},
 		{Field: types.DocumentFieldContainerHostNamespace},

@@ -48,6 +48,12 @@ type Store struct {
 
 // NewFromConfig creates a publication Store on the shared result backend.
 func NewFromConfig(ctx context.Context, config *driver.Config) (*Store, error) {
+	if config != nil && config.Driver == "doris" {
+		markerConfig := *config
+		markerConfig.DorisPartitionField = ""
+		markerConfig.DorisRetentionDays = 0
+		config = &markerConfig
+	}
 	markerStore, err := storage.NewFromConfig[*Marker](
 		ctx,
 		config,

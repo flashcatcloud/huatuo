@@ -65,6 +65,7 @@ type LocalFileConfig struct {
 // StorageConfig controls tracing data storage.
 type StorageConfig struct {
 	Elasticsearch internalconfig.ElasticsearchConfig
+	Doris         internalconfig.DorisConfig
 	LocalFile     LocalFileConfig
 }
 
@@ -261,6 +262,9 @@ func (c ProfilingConfig) Validate() error {
 
 // Validate rejects invalid storage settings.
 func (c *StorageConfig) Validate() error {
+	if err := c.Doris.Validate(); err != nil {
+		return fmt.Errorf("validating Doris config: %w", err)
+	}
 	if err := c.Elasticsearch.Validate(); err != nil {
 		return fmt.Errorf("validating Elasticsearch config: %w", err)
 	}

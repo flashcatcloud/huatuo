@@ -62,17 +62,22 @@ type Store struct {
 
 // NewFromConfig creates profiling storage backed by Elasticsearch.
 func NewFromConfig(ctx context.Context, config Config) (*Store, error) {
-	profileStore, err := storage.NewFromConfig[*Document](ctx, &driver.Config{
+	return NewWithBackendConfig(ctx, &driver.Config{
 		Driver:      "elasticsearch",
 		ESAddresses: config.Addresses,
 		ESUsername:  config.Username,
 		ESPassword:  config.Password,
 		ESIndex:     config.Index,
-	}, Collection, mapper{})
+	})
+}
+
+// NewWithBackendConfig creates profiling storage on the selected backend.
+func NewWithBackendConfig(ctx context.Context, config *driver.Config) (*Store, error) {
+	profileStore, err := storage.NewFromConfig[*Document](ctx, config, Collection, mapper{})
 	if err != nil {
 		return nil, err
 	}
-	log.WithField("driver", "elasticsearch").WithField("index", config.Index).Info(
+	log.WithField("driver", config.Driver).WithField("index", config.ESIndex).Info(
 		"initialized profile storage",
 	)
 	return &Store{store: profileStore}, nil

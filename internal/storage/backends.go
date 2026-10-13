@@ -15,6 +15,7 @@
 package storage
 
 import (
+	_ "github.com/ccfos/huatuo/internal/storage/doris"
 	// Register all built-in storage backends.
 	_ "github.com/ccfos/huatuo/internal/storage/elasticsearch"
 	_ "github.com/ccfos/huatuo/internal/storage/localfile"

@@ -34,6 +34,8 @@ type Store struct {
 
 // Config contains optional persistence backend settings.
 type Config struct {
+	// Backend adds a shared result backend alongside optional legacy backends.
+	Backend       *driver.Config
 	Elasticsearch *ElasticsearchConfig
 	LocalFile     *LocalFileConfig
 }
@@ -87,6 +89,14 @@ func NewFromConfig(
 			returnedErr = errors.Join(returnedErr, closeBackends(context.Background(), backends))
 		}
 	}()
+
+	if config.Backend != nil {
+		backend, err := storage.NewFromConfig[*Document](ctx, config.Backend, Collection, mapper{})
+		if err != nil {
+			return nil, fmt.Errorf("new tracing document store (%s): %w", config.Backend.Driver, err)
+		}
+		backends = append(backends, backend)
+	}
 
 	if config.Elasticsearch != nil {
 		backendConfig := config.Elasticsearch

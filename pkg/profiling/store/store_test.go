@@ -256,3 +256,21 @@ func TestBuildProfileHostQueryUsesMissingContainer(t *testing.T) {
 		t.Fatalf("host filters = %#v, want %#v", query.Filters, want)
 	}
 }
+
+func TestHostProfileMapperOmitsContainerHostname(t *testing.T) {
+	document := validDocument()
+	document.UploadedTimestamp = timeutil.Now()
+	document.ContainerHostname = ""
+	fields, err := (mapper{}).Fields(document)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields[types.DocumentFieldContainerHostname]; exists {
+		t.Fatal("host profile must match the not-exists container filter")
+	}
+	document.ContainerHostname = "pod"
+	fields, err = (mapper{}).Fields(document)
+	if err != nil || fields[types.DocumentFieldContainerHostname] != "pod" {
+		t.Fatalf("fields=%v err=%v", fields, err)
+	}
+}

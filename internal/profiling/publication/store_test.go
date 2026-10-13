@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/ccfos/huatuo/internal/storage"
+	"github.com/ccfos/huatuo/internal/storage/doris"
 	"github.com/ccfos/huatuo/internal/storage/driver"
 )
 
@@ -173,5 +174,38 @@ func TestStoreReturnsPublishFailure(t *testing.T) {
 
 	if err := store.Publish(t.Context(), "job-1"); !errors.Is(err, saveErr) {
 		t.Fatalf("Publish() error = %v, want %v", err, saveErr)
+	}
+}
+
+func TestDorisMarkersDoNotInheritWindowPartitions(t *testing.T) {
+	var captured driver.Config
+	driver.RegisterBackend("doris", func(config *driver.Config) (driver.Backend, error) {
+		captured = *config
+		return &memoryBackend{}, nil
+	})
+	t.Cleanup(func() {
+		driver.RegisterBackend("doris", func(config *driver.Config) (driver.Backend, error) { return doris.NewBackend(config) })
+	})
+	config := &driver.Config{Driver: "doris", DorisDatabase: "profiles", DorisPartitionField: "uploaded_timestamp", DorisRetentionDays: 30}
+	store, err := NewFromConfig(t.Context(), config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		if err := store.Close(t.Context()); err != nil {
+			t.Error(err)
+		}
+	}()
+	if captured.DorisPartitionField != "" || captured.DorisRetentionDays != 0 || captured.DorisDatabase != "profiles" {
+		t.Fatalf("marker config=%+v", captured)
+	}
+	if config.DorisPartitionField != "uploaded_timestamp" || config.DorisRetentionDays != 30 {
+		t.Fatalf("window config mutated: %+v", config)
+	}
+	if err := store.Publish(t.Context(), "request"); err != nil {
+		t.Fatal(err)
+	}
+	if published, err := store.IsPublished(t.Context(), "request"); err != nil || !published {
+		t.Fatalf("published=%v err=%v", published, err)
 	}
 }

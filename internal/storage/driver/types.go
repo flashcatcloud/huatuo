@@ -56,6 +56,25 @@ type Config struct {
 	ESUsername  string
 	ESPassword  string
 	ESIndex     string
+
+	// Doris queries run over the MySQL protocol on the FE query port, while
+	// writes go through Stream Load on the FE HTTP port; both are required.
+	DorisMySQLAddr string
+	DorisHTTPAddr  string
+	DorisDatabase  string
+	DorisUsername  string
+	DorisPassword  string
+	DorisBuckets   int
+	DorisReplicas  int
+
+	DorisBatchMaxRows         int
+	DorisFlushIntervalSeconds int
+	DorisMaxRetries           int
+
+	// DorisPartitionField names the KindTime field to range-partition on.
+	DorisPartitionField string
+	DorisRetentionDays  int
+	DorisGroupCommit    string
 }
 
 // Op is a storage query operator.
@@ -156,9 +175,21 @@ type SaveOptions struct {
 	WaitForVisibility bool
 }
 
+// Kind classifies an indexed field so backends that need typed columns can
+// create the right one. Backends that keep every field as text ignore it.
+type Kind string
+
+const (
+	// KindString is the zero value: the field is stored as text.
+	KindString Kind = ""
+	// KindTime marks a field containing time.Time or timeutil.Timestamp values.
+	KindTime Kind = "time"
+)
+
 // Index declares one queryable field.
 type Index struct {
 	Field string
+	Kind  Kind
 }
 
 // Mapper converts domain values of type T to and from the storage representation.
