@@ -71,11 +71,10 @@ type Storage struct {
 	batchMaxRows  int
 	flushInterval time.Duration
 
-	partitionField  string
-	partitionColumn string
-	retentionDays   int
-	maxRetries      int
-	groupCommit     string
+	partitionField string
+	retentionDays  int
+	maxRetries     int
+	groupCommit    string
 
 	table  string
 	loader *streamLoader
@@ -175,11 +174,6 @@ func (s *Storage) Init(ctx context.Context, collection string, indexes []driver.
 	})
 	if buildErr != nil {
 		return buildErr
-	}
-	if s.partitionField != "" {
-		if s.partitionColumn, err = resolveColumn(s.partitionField); err != nil {
-			return err
-		}
 	}
 	if _, err := s.db.ExecContext(ctx, createSQL); err != nil {
 		return fmt.Errorf("doris backend init table %s: %w", s.table, err)

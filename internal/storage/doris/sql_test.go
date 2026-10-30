@@ -142,6 +142,7 @@ func TestBuildCreateTableSQL(t *testing.T) {
 		"`data` STRING NULL",
 		"INDEX `idx_f_hostname` (`f_hostname`) USING INVERTED PROPERTIES(\"parser\" = \"basic\")",
 		"\"dynamic_partition.enable\" = \"true\"",
+		"\"dynamic_partition.time_unit\" = \"DAY\"",
 		"\"dynamic_partition.start\" = \"-30\"",
 		"\"dynamic_partition.end\" = \"3\"",
 	}
