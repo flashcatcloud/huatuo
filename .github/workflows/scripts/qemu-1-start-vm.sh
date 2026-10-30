@@ -67,6 +67,13 @@ write_context
 	--image "$VM_IMAGE_REF" --package-dir "$package_dir" \
 	--distro "$OS_DISTRO" --arch "$ARCH" --pull "$VM_IMAGE_PULL"
 
+# Anolis starts with roughly 11G used; compilation and test workloads can
+# push the 20G root filesystem into kubelet disk pressure and image GC.
+vm_disk_size=20G
+if [[ "$OS_DISTRO" == anolis8.10 ]]; then
+	vm_disk_size=40G
+fi
+
 start_args=(
 	start
 	--package "$package_dir"
@@ -75,7 +82,7 @@ start_args=(
 	--ssh-key "$SSH_KEY"
 	--vcpus 4
 	--memory 8192
-	--disk-size 20G
+	--disk-size "$vm_disk_size"
 	--init-kubernetes
 )
 [[ -z "$VM_NAME" ]] || start_args+=(--name "$VM_NAME")
