@@ -31,18 +31,28 @@ class UploadTests(unittest.TestCase):
 
     def test_identical_existing_is_not_overwritten(self):
         self.run_publish()
-        self.client.put_object.assert_not_called()
+        self.client.upload_file.assert_not_called()
 
     def test_existing_conflict_fails(self):
         self.client.download_file.side_effect = lambda **kw: Path(kw["DestFilePath"]).write_bytes(b"different")
         with self.assertRaises(ValueError):
             self.run_publish()
-        self.client.put_object.assert_not_called()
+        self.client.upload_file.assert_not_called()
 
     def test_missing_uploads_with_overwrite_protection(self):
         self.client.head_object.side_effect = CosServiceError("HEAD", {}, 404)
         self.run_publish()
-        self.assertEqual(self.client.put_object.call_args.kwargs["Metadata"], {"x-cos-forbid-overwrite": "true"})
+        self.assertEqual(self.client.upload_file.call_args.kwargs["Metadata"], {"x-cos-forbid-overwrite": "true"})
+
+    def test_multipart_completion_preserves_overwrite_protection(self):
+        from qcloud_cos import CosConfig, CosS3Client
+        client = upload.ImmutableCosClient(CosConfig(Region="ap-nanjing",
+                                                   SecretId="test", SecretKey="test"))
+        with patch.object(CosS3Client, "complete_multipart_upload") as complete:
+            client.complete_multipart_upload(Bucket="bucket", Key="key",
+                                             UploadId="id", MultipartUpload={"Part": []})
+        self.assertEqual(complete.call_args.kwargs["Metadata"],
+                         {"x-cos-forbid-overwrite": "true"})
 
     def test_sdk_header_mapping(self):
         from qcloud_cos.cos_comm import mapped
@@ -53,11 +63,11 @@ class UploadTests(unittest.TestCase):
         self.client.head_object.side_effect = CosServiceError("HEAD", {}, 403)
         with self.assertRaises(CosServiceError):
             self.run_publish()
-        self.client.put_object.assert_not_called()
+        self.client.upload_file.assert_not_called()
 
     def test_upload_error_propagates(self):
         self.client.head_object.side_effect = CosServiceError("HEAD", {}, 404)
-        self.client.put_object.side_effect = RuntimeError("network failure")
+        self.client.upload_file.side_effect = RuntimeError("network failure")
         with self.assertRaises(RuntimeError):
             self.run_publish()
         self.client.download_file.assert_not_called()
