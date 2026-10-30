@@ -82,7 +82,7 @@ func TestSaveSyncWaitsForVisiblePayload(t *testing.T) {
 		var rows []map[string]any
 		if err := json.NewDecoder(r.Body).Decode(&rows); err != nil {
 			t.Error(err)
-			http.Error(w, "decode", 400)
+			http.Error(w, "decode", http.StatusBadRequest)
 			return
 		}
 		for _, row := range rows {

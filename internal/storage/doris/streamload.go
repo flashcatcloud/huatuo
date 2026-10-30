@@ -216,7 +216,7 @@ func classifyStreamLoadResult(result *streamLoadResponse) error {
 		result.Status, result.Message, result.ErrorURL)
 }
 
-// isPermanentStreamLoadMessage recognises the Doris error families that describe
+// isPermanentStreamLoadMessage recognizes the Doris error families that describe
 // bad data or a bad request rather than a transient server condition.
 func isPermanentStreamLoadMessage(message string) bool {
 	upper := strings.ToUpper(message)
@@ -230,10 +230,10 @@ func isPermanentStreamLoadMessage(message string) bool {
 }
 
 func truncate(s string) string {
-	const max = 512
-	if len(s) <= max {
+	const maxLength = 512
+	if len(s) <= maxLength {
 		return s
 	}
 
-	return s[:max] + "..."
+	return s[:maxLength] + "..."
 }

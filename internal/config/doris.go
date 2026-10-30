@@ -59,12 +59,12 @@ type DorisConfig struct {
 }
 
 // Enabled reports whether both endpoints opt in to Doris.
-func (c DorisConfig) Enabled() bool {
+func (c *DorisConfig) Enabled() bool {
 	return strings.TrimSpace(c.MySQLAddr) != "" && strings.TrimSpace(c.HTTPAddr) != ""
 }
 
 // Validate accepts either both endpoints or neither.
-func (c DorisConfig) Validate() error {
+func (c *DorisConfig) Validate() error {
 	mysqlSet := strings.TrimSpace(c.MySQLAddr) != ""
 	httpSet := strings.TrimSpace(c.HTTPAddr) != ""
 
@@ -88,7 +88,7 @@ func (c DorisConfig) Validate() error {
 }
 
 // DriverConfig renders the storage driver configuration for this section.
-func (c DorisConfig) DriverConfig() *driver.Config {
+func (c *DorisConfig) DriverConfig() *driver.Config {
 	return &driver.Config{
 		Driver:                    "doris",
 		DorisMySQLAddr:            strings.TrimSpace(c.MySQLAddr),

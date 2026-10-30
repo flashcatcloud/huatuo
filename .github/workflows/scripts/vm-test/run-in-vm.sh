@@ -161,6 +161,22 @@ install_temporary_go_tools() {
 	done
 }
 
+report_test_failure() {
+	local status=$?
+	if ((status != 0)); then
+		vm_log_error "guest tests failed (exit $status); collecting disk and image diagnostics"
+		df -h || true
+		df -i || true
+		du -xsh /var/lib/containerd /var/lib/docker /root/.cache/go-build /mnt/host 2> /dev/null || true
+		crictl images --digests || true
+		kubectl get nodes -o wide || true
+		kubectl get events -A --sort-by=.metadata.creationTimestamp | tail -80 || true
+		journalctl -u kubelet --since '-30 minutes' --no-pager | tail -300 || true
+	fi
+	exit "$status"
+}
+
+trap report_test_failure EXIT
 configure_proxy
 print_sys_info
 export PATH="/usr/local/go/bin:${HOME}/go/bin:${PATH}"

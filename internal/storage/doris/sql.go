@@ -35,7 +35,7 @@ const (
 
 // timeLayout is lexically sortable in UTC, so string comparison on a VARCHAR
 // column yields chronological ordering. Every time value — stored or filtered
-// — is funnelled through normalizeValue into this one layout; mixing layouts
+// — is funneled through normalizeValue into this one layout; mixing layouts
 // silently breaks range filters.
 const timeLayout = "2006-01-02 15:04:05.000000"
 
@@ -212,7 +212,7 @@ func buildCreateTableSQL(database, table string, indexes []driver.Index, opts Ta
 	// scan — acceptable because partition pruning bounds what they scan.
 	for _, column := range textColumns {
 		columns = append(columns, fmt.Sprintf(
-			"INDEX %s (%s) USING INVERTED PROPERTIES(\"parser\" = \"%s\")",
+			"INDEX %s (%s) USING INVERTED PROPERTIES(\"parser\" = %q)",
 			quote("idx_"+column), quote(column), indexParser))
 	}
 
@@ -232,7 +232,7 @@ func buildCreateTableSQL(database, table string, indexes []driver.Index, opts Ta
 		}
 		properties = append(properties,
 			"\"dynamic_partition.enable\" = \"true\"",
-			fmt.Sprintf("\"dynamic_partition.time_unit\" = \"%s\"", partitionTimeUnit),
+			fmt.Sprintf("\"dynamic_partition.time_unit\" = %q", partitionTimeUnit),
 			// Doris counts retained history backwards from today.
 			fmt.Sprintf("\"dynamic_partition.start\" = \"-%d\"", retention),
 			fmt.Sprintf("\"dynamic_partition.end\" = \"%d\"", partitionsAhead),
