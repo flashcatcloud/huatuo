@@ -1,0 +1,95 @@
+name: Flashcat Huatuo artifacts
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to build and publish
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: huatuo-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cos-python-sdk-v5==1.9.38
+      - run: |
+          bash -n build/release/package.sh
+          python3 -m unittest discover -s build/release -p 'test_*.py' -v
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+          fetch-depth: 0
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev binutils capnproto
+          go install github.com/vektra/mockery/v2@v2.53.6
+          go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
+      - name: Build and verify archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: bash build/release/package.sh "$RELEASE_TAG" "$RELEASE_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    environment: release
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref_name }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: huatuo-*
+          merge-multiple: true
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install cos-python-sdk-v5==1.9.38
+      - name: Upload and verify COS objects
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          FC_COS_SECRETID: ${{ secrets.FC_COS_SECRETID }}
+          FC_COS_SECRETKEY: ${{ secrets.FC_COS_SECRETKEY }}
+          FC_COS_BUCKET: ${{ secrets.FC_COS_BUCKET }}
+          FC_COS_REGION: ${{ vars.FC_COS_REGION || 'ap-nanjing' }}
+        run: python3 build/release/upload.py dist "$RELEASE_TAG"

@@ -7,6 +7,7 @@ on:
 
 jobs:
   release-x:
+    if: github.repository == 'ccfos/huatuo'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
