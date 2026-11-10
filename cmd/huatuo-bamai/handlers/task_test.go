@@ -15,21 +15,8 @@
 package handlers
 
 import (
-	"net/http"
 	"testing"
 )
-
-func TestTaskHandlerRegistersListRoute(t *testing.T) {
-	h := NewTaskHandler()
-
-	for _, route := range h.Handlers {
-		if route.Method == http.MethodGet && route.Path == "" {
-			return
-		}
-	}
-
-	t.Fatal("NewTaskHandler() should register GET /tasks list route")
-}
 
 func TestHostCPURequest(t *testing.T) {
 	for _, lang := range []string{"java", "python", "go", "c++"} {

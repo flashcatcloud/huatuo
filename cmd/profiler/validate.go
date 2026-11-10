@@ -17,16 +17,15 @@ package main
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/urfave/cli/v2"
 
-	"huatuo-bamai/internal/pod"
-	pcontext "huatuo-bamai/internal/profiler/context"
-	"huatuo-bamai/pkg/profiling"
+	"github.com/ccfos/huatuo/internal/pod"
+	pcontext "github.com/ccfos/huatuo/internal/profiler/context"
+	"github.com/ccfos/huatuo/pkg/profiling"
 )
 
 func runBefore(ctx *cli.Context) error {
@@ -62,15 +61,6 @@ func runBefore(ctx *cli.Context) error {
 	}
 	if !profiling.IsSupported(lang, typ) {
 		return fmt.Errorf("language %s does not support profiling type %s", lang, typ)
-	}
-	// py-spy records a host PID once for the full requested duration.
-	if lang == profiling.LanguagePython && typ == profiling.TypeCPU && ctx.String("pid") != "" && ctx.String("output-format") == "remote" {
-		duration, interval := ctx.Int("duration"), ctx.Int("aggr-interval")
-		if interval > 0 && interval < duration {
-			if err := ctx.Set("aggr-interval", strconv.Itoa(duration)); err != nil {
-				return err
-			}
-		}
 	}
 	if err := validatePythonProfileOptions(lang, typ, ctx.Int("duration"), ctx.Int("aggr-interval")); err != nil {
 		return err
@@ -139,18 +129,16 @@ func validateLanguageOptions(ctx *cli.Context, lang profiling.Language, typ prof
 		return nil
 
 	case profiling.LanguageJava, profiling.LanguagePython:
-		// n9e-plus sends only the target PID; samplers ship beside bin/profiler.
-		if !ctx.IsSet("tool-path") {
-			exe, err := os.Executable()
-			if err != nil {
-				return fmt.Errorf("locate packaged profiler: %w", err)
-			}
-			if err := ctx.Set("tool-path", filepath.Dir(filepath.Dir(exe))); err != nil {
-				return err
-			}
+		toolDir := ctx.String("tool-path")
+		if toolDir == "" {
+			return fmt.Errorf("language=%s requires --tool-path", lang)
 		}
-		if ctx.String("tool-path") == "" {
-			return fmt.Errorf("language=%s requires a nonempty --tool-path", lang)
+		info, err := os.Stat(toolDir)
+		if err != nil {
+			return fmt.Errorf("profiling tool directory %q is unavailable: %w", toolDir, err)
+		}
+		if !info.IsDir() {
+			return fmt.Errorf("profiling tool path %q must be a directory", toolDir)
 		}
 		return validateExactlyOneTarget(ctx)
 
@@ -237,17 +225,6 @@ func validateCommonOptions(ctx *cli.Context) error {
 		return err
 	}
 
-	if toolPath := ctx.String("tool-path"); toolPath != "" {
-		info, err := os.Stat(toolPath)
-		if err != nil {
-			return fmt.Errorf("tool-path does not exist: %s", toolPath)
-		}
-
-		if !info.IsDir() {
-			return fmt.Errorf("tool-path must be a directory: %s", toolPath)
-		}
-	}
-
 	if ctx.String("output-format") == "remote" && ctx.String("output-storage") == "" {
 		return fmt.Errorf("--output-storage must not be empty when --output-format=remote")
 	}
@@ -272,20 +249,20 @@ func validateNumericOptions(profileType profiling.Type, freq, maxProfilerProcess
 }
 
 func validateProfilerFlagCompatibility(ctx *cli.Context, lang profiling.Language, typ profiling.Type) error {
-	implementation, _ := profiling.ImplementationFor(lang)
+	implementation, _ := profiling.ImplementationFor(lang, typ)
 	native := implementation == profiling.ImplementationNative
 	nativeCPU := native && typ == profiling.TypeCPU
 	nativeMemory := native && typ == profiling.TypeMemory
-	cpuMode, err := profiling.ParseCPUMode(ctx.String("cpu-mode"))
-	if err != nil {
-		return err
+	cpuMode := profiling.Mode(ctx.String("cpu-mode"))
+	if cpuMode != profiling.ModeOnCPU && cpuMode != profiling.ModeOffCPU {
+		return fmt.Errorf("unsupported CPU mode %q", cpuMode)
 	}
 	if _, err := profiling.ParseOffCPUPhase(ctx.String("offcpu-phase")); err != nil {
 		return err
 	}
-	offCPU := nativeCPU && cpuMode == profiling.CPUModeOffCPU
+	offCPU := nativeCPU && cpuMode == profiling.ModeOffCPU
 
-	if cpuMode == profiling.CPUModeOffCPU && !nativeCPU {
+	if cpuMode == profiling.ModeOffCPU && !nativeCPU {
 		return fmt.Errorf("--cpu-mode=offcpu is supported only by native CPU profiling")
 	}
 	if ctx.IsSet("cpu-mode") && typ != profiling.TypeCPU {
@@ -326,7 +303,7 @@ func validateProfilerFlagCompatibility(ctx *cli.Context, lang profiling.Language
 	}
 	if ctx.IsSet("physical-memory-probability") {
 		physicalMemory := nativeMemory &&
-			profiling.MemoryMode(ctx.String("memory-mode")) != profiling.MemoryModeVirtualAlloc
+			profiling.Mode(ctx.String("memory-mode")) != profiling.ModeVirtualAlloc
 		if !physicalMemory {
 			return fmt.Errorf("--physical-memory-probability is supported only by native physical memory profiling")
 		}
@@ -357,14 +334,11 @@ func validateMemoryMode(lang profiling.Language, typ profiling.Type, value strin
 	if value == "" {
 		return fmt.Errorf("--memory-mode is required when --type=memory")
 	}
-	mode, err := profiling.ParseMemoryMode(value)
-	if err != nil {
-		return err
-	}
-	if profiling.SupportsMemoryMode(lang, mode) {
+	mode := profiling.Mode(value)
+	if profiling.SupportsMode(lang, typ, mode) {
 		return nil
 	}
-	supported := profiling.MemoryModesFor(lang)
+	supported := profiling.ModesFor(lang, typ)
 	values := make([]string, 0, len(supported))
 	for _, candidate := range supported {
 		values = append(values, string(candidate))

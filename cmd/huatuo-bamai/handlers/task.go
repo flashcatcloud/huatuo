@@ -16,6 +16,13 @@ package handlers
 
 import (
 	"errors"
+	"github.com/ccfos/huatuo/internal/nodeagent/operation"
+	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
+	"github.com/ccfos/huatuo/internal/server"
+	"github.com/ccfos/huatuo/internal/server/response"
+	"github.com/ccfos/huatuo/pkg/observation"
+	"github.com/ccfos/huatuo/pkg/profiling"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -23,30 +30,7 @@ import (
 	"slices"
 	"strconv"
 	"time"
-
-	v1 "huatuo-bamai/apis/v1"
-	"huatuo-bamai/cmd/huatuo-bamai/config"
-	"huatuo-bamai/internal/server"
-	"huatuo-bamai/internal/server/response"
-	"huatuo-bamai/pkg/tracing"
-
-	"github.com/go-playground/validator/v10"
 )
-
-type TaskHandler struct {
-	Handlers []server.Route
-}
-
-func NewTaskHandler() *TaskHandler {
-	h := &TaskHandler{}
-	h.Handlers = []server.Route{
-		{Method: http.MethodPost, Path: "", Handler: h.create},
-		{Method: http.MethodGet, Path: "", Handler: h.list},
-		{Method: http.MethodGet, Path: "/:id", Handler: h.get},
-		{Method: http.MethodDelete, Path: "/:id", Handler: h.stop},
-	}
-	return h
-}
 
 type NewTaskReq struct {
 	RequestID  string   `json:"request_id" binding:"omitempty,max=128"`
@@ -55,9 +39,6 @@ type NewTaskReq struct {
 	DataType   string   `json:"data_type" binding:"required"`
 	TracerArgs []string `json:"trace_args" binding:"omitempty"`
 }
-
-// Set at link time only for the Flashcat host profiling release.
-var hostCPURelease string
 
 var hostJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
@@ -76,10 +57,12 @@ func validateHostCPU(req NewTaskReq, executable string) error {
 	a = a[6:]
 	switch lang {
 	case "java", "python":
-		if len(a) < 2 || a[0] != "--tool-path" || a[1] != filepath.Dir(filepath.Dir(executable)) {
-			return invalid
+		if len(a) > 0 && a[0] == "--tool-path" {
+			if len(a) < 2 || a[1] != filepath.Dir(filepath.Dir(executable)) {
+				return invalid
+			}
+			a = a[2:]
 		}
-		a = a[2:]
 	case "go", "c++":
 		if len(a) < 1 || a[0] != "--thread-group" {
 			return invalid
@@ -90,7 +73,7 @@ func validateHostCPU(req NewTaskReq, executable string) error {
 	}
 	duration := req.Timeout - 20
 	interval := 10
-	if lang == "python" {
+	if lang == "python" && len(a) > 5 && a[5] == strconv.Itoa(duration) {
 		interval = duration
 	}
 	if !slices.Equal(a, []string{
@@ -103,104 +86,63 @@ func validateHostCPU(req NewTaskReq, executable string) error {
 	return nil
 }
 
-func handleBindError(ctx *server.Context, err error) {
-	var validationError *validator.ValidationErrors
-	if errors.As(err, &validationError) {
-		response.ErrorWithCode(
-			ctx,
-			http.StatusBadRequest,
-			v1.ErrorCodeInvalidRequest,
-			(*validationError)[0].Namespace(),
-		)
-		return
+func hostTaskRoutes(opts *ServerOptions) []server.Route {
+	routes := []server.Route{
+		{Method: http.MethodPost, Path: "", Handler: func(ctx *server.Context) error {
+			var req NewTaskReq
+			if err := ctx.ShouldBindJSON(&req); err != nil {
+				return response.ErrInvalidRequest.WithMessage(err.Error())
+			}
+			exe, err := os.Executable()
+			if err != nil {
+				return err
+			}
+			if err := validateHostCPU(req, exe); err != nil {
+				return response.ErrInvalidRequest.WithMessage(err.Error())
+			}
+			pid, _ := strconv.Atoi(req.TracerArgs[5])
+			op, _, err := opts.ProfilingService.Start(ctx.Request().Context(), &nodeprofiling.StartRequest{RequestID: req.RequestID, HostPID: pid, Duration: time.Duration(req.Timeout-20) * time.Second, Scope: observation.ScopeHost, Spec: profiling.Spec{Language: profiling.Language(req.TracerArgs[3]), Type: profiling.TypeCPU, Mode: profiling.ModeOnCPU}})
+			if err != nil {
+				return nodeAPIError(err)
+			}
+			response.Success(ctx, map[string]string{"task_id": op.RequestID})
+			return nil
+		}},
+		{Method: http.MethodGet, Path: "/:id", Handler: func(ctx *server.Context) error {
+			op, err := opts.OperationManager.GetByID(ctx.Param("id"))
+			if err != nil {
+				return nodeAPIError(err)
+			}
+			result := map[string]string{"status": "running"}
+			if op.Terminal != nil {
+				result["status"] = string(op.Terminal.Outcome)
+				if op.Terminal.Outcome != operation.OutcomeCompleted {
+					result["status"] = "failed"
+					result["error"] = op.Terminal.Message
+				}
+			}
+			response.Success(ctx, result)
+			return nil
+		}},
+		{Method: http.MethodDelete, Path: "/:id", Handler: func(ctx *server.Context) error {
+			_, _, err := opts.OperationManager.StopByID(ctx.Param("id"))
+			if err != nil {
+				return nodeAPIError(err)
+			}
+			ctx.Status(http.StatusNoContent)
+			return nil
+		}},
 	}
-	response.ErrorWithCode(ctx, http.StatusBadRequest, v1.ErrorCodeInvalidRequest, err.Error())
-}
-
-func (h *TaskHandler) create(ctx *server.Context) error {
-	var req NewTaskReq
-	if err := ctx.ShouldBindJSON(&req); err != nil {
-		handleBindError(ctx, err)
-		return nil
-	}
-
-	if hostCPURelease == "true" {
-		exe, err := os.Executable()
-		if err != nil {
-			return response.ErrInternal.WithMessage("cannot locate packaged profiler tools")
+	for i := range routes {
+		handler := routes[i].Handler
+		routes[i].Handler = func(ctx *server.Context) error {
+			host, _, err := net.SplitHostPort(ctx.Request().RemoteAddr)
+			if err != nil || !net.ParseIP(host).IsLoopback() {
+				ctx.Status(http.StatusForbidden)
+				return nil
+			}
+			return handler(ctx)
 		}
-		if err := validateHostCPU(req, exe); err != nil {
-			return response.ErrInvalidRequest.WithMessage(err.Error())
-		}
 	}
-	storageDefault := tracing.TaskStorageDB
-	if req.DataType == "json" {
-		storageDefault = tracing.TaskStorageStdout
-	}
-
-	id := req.RequestID
-	if id == "" {
-		var err error
-		id, err = tracing.AllocTaskID()
-		if err != nil {
-			return response.ErrInternal.WithMessage("failed to allocate task id")
-		}
-	}
-	id, err := tracing.NewTaskWithIDLimit(
-		id,
-		req.TracerName,
-		time.Duration(req.Timeout)*time.Second,
-		storageDefault,
-		req.TracerArgs,
-		config.Get().Tasks.MaxConcurrent,
-	)
-	if err != nil {
-		if errors.Is(err, tracing.ErrTaskLimitExceeded) {
-			return response.ErrInvalidRequest.WithMessage(err.Error())
-		}
-		return response.ErrInvalidRequest.WithMessage(err.Error())
-	}
-	response.Success(ctx, map[string]any{"task_id": id})
-	return nil
-}
-
-func (h *TaskHandler) list(ctx *server.Context) error {
-	response.Success(ctx, map[string]any{"tasks": tracing.ListTasks()})
-	return nil
-}
-
-func (h *TaskHandler) get(ctx *server.Context) error {
-	id := ctx.Param("id")
-	if id == "" {
-		return response.ErrInvalidRequest.WithMessage("missing task id")
-	}
-
-	result := tracing.Result(id)
-	responseData := map[string]any{"status": result.TaskStatus}
-	switch result.TaskStatus {
-	case tracing.StatusCompleted:
-		responseData["data"] = string(result.TaskData)
-	case tracing.StatusNotExist, tracing.StatusFailed:
-		responseData["error"] = result.TaskErr.Error()
-	}
-
-	response.Success(ctx, responseData)
-	return nil
-}
-
-func (h *TaskHandler) stop(ctx *server.Context) error {
-	taskID := ctx.Param("id")
-	if taskID == "" {
-		return response.ErrInvalidRequest.WithMessage("missing task id")
-	}
-
-	if err := tracing.StopTask(taskID); err != nil {
-		if errors.Is(err, tracing.ErrTaskNotFound) {
-			return response.ErrNotFound.WithMessage("task not found")
-		}
-		return response.ErrInternal.WithMessage(err.Error())
-	}
-
-	ctx.Status(http.StatusNoContent)
-	return nil
+	return routes
 }

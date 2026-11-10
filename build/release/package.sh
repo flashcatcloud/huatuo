@@ -24,8 +24,7 @@ epoch=$(git show -s --format=%ct HEAD)
 	echo "_output exists; use a fresh checkout" >&2
 	exit 1
 }
-make build EXTRA_LDFLAGS="-X huatuo-bamai/cmd/huatuo-bamai/handlers.hostCPURelease=true" BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
-make sync
+make build EXTRA_LDFLAGS="-X github.com/ccfos/huatuo/cmd/huatuo-bamai/config.hostCPURelease=true" BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
 bash build/install-tools.sh
 for command in cmd/*/; do
 	test -x "_output/bin/$(basename "$command")"
@@ -35,6 +34,8 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name" dist
 cp -R _output/bin _output/bpf _output/conf "$stage/$name/"
+# The host CPU package serves local n9e tasks and needs no node API credential.
+sed -i '/^[[:space:]]*BearerToken = "REPLACE_WITH_RANDOM_HEX"$/d' "$stage/$name/conf/huatuo-bamai.conf"
 cp LICENSE "$stage/$name/"
 cp _output/tools/bin/asprof "$stage/$name/bin/"
 cp -R _output/tools/lib "$stage/$name/"

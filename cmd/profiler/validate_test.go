@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"testing"
@@ -27,7 +28,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/urfave/cli/v2"
 
-	"huatuo-bamai/pkg/profiling"
+	"github.com/ccfos/huatuo/pkg/profiling"
 )
 
 func TestCLIProfileTypeAndRemovedFlags(t *testing.T) {
@@ -618,10 +619,20 @@ func TestValidatePythonProfileOptions(t *testing.T) {
 	}
 }
 
-func TestRemotePythonPIDUsesOneWindow(t *testing.T) {
-	ctx := newValidationCLIContext(t, "--language", "python", "--type", "cpu", "--pid", strconv.Itoa(os.Getpid()),
-		"--duration", "20", "--aggr-interval", "10", "--output-format", "remote", "--tracer-id", "host-window",
-		"--output-storage", "/var/run/huatuo-toolstream.sock", "--log-file", "stdout")
-	require.NoError(t, runBefore(ctx))
-	require.Equal(t, 20, ctx.Int("aggr-interval"))
+func TestValidateLanguageOptionsToolRoot(t *testing.T) {
+	root := t.TempDir()
+	for _, language := range []profiling.Language{
+		profiling.LanguageJava, profiling.LanguagePython, profiling.LanguageGo,
+	} {
+		t.Run(string(language), func(t *testing.T) {
+			for _, directory := range []string{"", root, filepath.Join(root, "missing")} {
+				ctx := newValidationCLIContext(t, "--pid", "1", "--tool-path", directory)
+				err := validateLanguageOptions(ctx, language, profiling.TypeCPU)
+				wantError := language != profiling.LanguageGo && directory != root
+				if (err != nil) != wantError {
+					t.Errorf("validateLanguageOptions(%q) error = %v, want error %t", directory, err, wantError)
+				}
+			}
+		})
+	}
 }

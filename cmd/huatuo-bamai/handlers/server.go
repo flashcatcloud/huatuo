@@ -15,60 +15,104 @@
 package handlers
 
 import (
-	"net/http"
+	"fmt"
+	"time"
 
-	"huatuo-bamai/cmd/huatuo-bamai/config"
-	"huatuo-bamai/internal/server"
-	"huatuo-bamai/internal/version"
-	"huatuo-bamai/pkg/tracing"
+	nodeapi "github.com/ccfos/huatuo/apis/v1/node"
+	"github.com/ccfos/huatuo/cmd/huatuo-bamai/config"
+	nodecloudevents "github.com/ccfos/huatuo/internal/nodeagent/cloudevents"
+	"github.com/ccfos/huatuo/internal/nodeagent/operation"
+	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
+	nodetracing "github.com/ccfos/huatuo/internal/nodeagent/tracing"
+	"github.com/ccfos/huatuo/internal/server"
+	"github.com/ccfos/huatuo/internal/server/response"
+	"github.com/ccfos/huatuo/internal/version"
 
+	httpGin "github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
 // ServerOptions groups the dependencies required to start the HTTP server.
 type ServerOptions struct {
-	Addr           string
-	TracingManager *tracing.Manager
-	PromReg        *prometheus.Registry
-	VersionInfo    *version.Info
+	Addr              string
+	BearerToken       string
+	OperationManager  *operation.Manager
+	ProfilingService  *nodeprofiling.Service
+	TracingService    *nodetracing.Service
+	CloudEvents       *nodecloudevents.Service
+	KeepAliveInterval time.Duration
+	PromReg           *prometheus.Registry
+	VersionInfo       *version.Info
 }
 
 // Start starts the HTTP server with all handlers registered.
-func Start(opts ServerOptions) (*server.Server, error) {
-	s := server.NewServer(&server.Config{
-		EnablePProf: hostCPURelease != "true",
+func Start(opts *ServerOptions) (*server.Server, error) {
+	nodeHandler, err := NewNodeAPIHandler(&NodeAPIHandlerOptions{
+		OperationManager:             opts.OperationManager,
+		ProfilingService:             opts.ProfilingService,
+		TracingService:               opts.TracingService,
+		CloudEventsService:           opts.CloudEvents,
+		EventStreamKeepAliveInterval: opts.KeepAliveInterval,
+	})
+	if err != nil {
+		return nil, err
+	}
+	s, err := newHTTPServer(opts, nodeHandler)
+	if err != nil {
+		return nil, err
+	}
+	if err := s.Start(opts.Addr); err != nil {
+		return nil, err
+	}
+
+	return s, nil
+}
+
+func newHTTPServer(opts *ServerOptions, nodeHandler *NodeAPIHandler) (*server.Server, error) {
+	cfg := &server.Config{
+		EnablePProf: true,
 		RateLimit: &server.RateLimitConfig{
 			RequestsPerSecond: 200,
 			Burst:             200,
 		},
 		EnableRetry: true,
+		AuthTokens:  []string{opts.BearerToken},
+		PublicPaths: []string{
+			"/openapi.json",
+			"/readyz",
+			"/v1/containers/:container_id",
+		},
 		PromReg:     opts.PromReg,
 		VersionInfo: opts.VersionInfo,
-	})
-
-	SetTracingManager(opts.TracingManager)
-
-	s.MustRegisterRoutes("/tasks", NewTaskHandler().Handlers)
-	for _, route := range NewTracerHandler(opts.TracingManager).Handlers {
-		if hostCPURelease != "true" || route.Method == http.MethodGet {
-			s.MustRegisterRoutes("/tracers", []server.Route{route})
-		}
+		ErrorStatusMapper: response.ChainHTTPStatusMappers(
+			nodeapi.HTTPStatusForErrorCode,
+			response.LegacyHTTPStatusForErrorCode,
+		),
 	}
-	s.MustRegisterRoutes("", NewContainerHandler().Handlers)
-	if hostCPURelease != "true" {
-		s.MustRegisterRoutes("", NewConfigHandler().Handlers)
+	if config.HostCPURelease() {
+		// The packaged endpoint serves only n9e host CPU operations.
+		cfg.EnablePProf = false
+		cfg.AuthTokens = nil
+		s := server.NewServer(cfg)
+		s.MustRegisterRoutes("/tasks", hostTaskRoutes(opts))
+		s.MustRegisterRoutes("", []server.Route{{Method: "GET", Path: "/healthz", Handler: func(ctx *server.Context) error { ctx.Status(200); return nil }}})
+		return s, nil
 	}
-	httpConfig := config.Get().HTTPServer
-	s.MustRegisterRoutes(
-		"/v1/events",
-		NewEventsHandler(
-			httpConfig.MaxEventStreamClients,
-			httpConfig.EventStreamKeepAliveIntervalSeconds,
-		).Handlers,
+	s := server.NewServer(cfg)
+	errorHandlers := s.StrictErrorHandlers()
+	strictHandler := nodeapi.NewStrictHandlerWithOptions(
+		nodeHandler,
+		nil,
+		nodeapi.StrictGinServerOptions{
+			RequestErrorHandlerFunc:  errorHandlers.RequestError,
+			HandlerErrorFunc:         errorHandlers.HandlerError,
+			ResponseErrorHandlerFunc: errorHandlers.ResponseError,
+		},
 	)
-
-	if err := s.Start(opts.Addr); err != nil {
-		return nil, err
+	if err := s.RegisterOpenAPIHandlers(nodeapi.OpenAPIJSON(), func(router httpGin.IRouter) {
+		nodeapi.RegisterHandlers(router, strictHandler)
+	}); err != nil {
+		return nil, fmt.Errorf("register Node API handlers: %w", err)
 	}
 
 	return s, nil

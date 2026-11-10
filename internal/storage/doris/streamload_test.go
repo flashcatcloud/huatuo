@@ -29,9 +29,9 @@ import (
 func shortenBackoff(t *testing.T) {
 	t.Helper()
 
-	initial, max := retryInitialInterval, retryMaxInterval
+	initial, maximum := retryInitialInterval, retryMaxInterval
 	retryInitialInterval, retryMaxInterval = time.Millisecond, 2*time.Millisecond
-	t.Cleanup(func() { retryInitialInterval, retryMaxInterval = initial, max })
+	t.Cleanup(func() { retryInitialInterval, retryMaxInterval = initial, maximum })
 }
 
 type recordedRequest struct {

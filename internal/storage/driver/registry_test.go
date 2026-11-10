@@ -26,7 +26,7 @@ func (b *testBackend) Init(context.Context, string, []Index) error {
 	return nil
 }
 
-func (b *testBackend) Save(context.Context, Record) error {
+func (b *testBackend) Save(context.Context, Record, SaveOptions) error {
 	return nil
 }
 
@@ -38,8 +38,12 @@ func (b *testBackend) Delete(context.Context, string) error {
 	return nil
 }
 
-func (b *testBackend) Query(context.Context, Query) ([]Record, error) {
-	return nil, nil
+func (b *testBackend) DeleteByQuery(context.Context, DeleteQuery) (int64, error) {
+	return 0, nil
+}
+
+func (b *testBackend) Query(context.Context, Query, func([]Record) error) error {
+	return nil
 }
 
 func (b *testBackend) Count(context.Context, Query) (int64, error) {

@@ -26,9 +26,18 @@ func TestCompactELFMatchesSymbolsAndCachesNames(t *testing.T) {
 	if err != nil {
 		t.Skip("requires ELF test executable")
 	}
-	reference := elfSymbols(f)
-	index, ok := newELFIndex(f).(*compactELF)
-	if !ok {
+	var reference symbols
+	for _, load := range []func() ([]elf.Symbol, error){f.DynamicSymbols, f.Symbols} {
+		all, _ := load()
+		for _, e := range all {
+			if elf.ST_TYPE(e.Info) == elf.STT_FUNC {
+				reference = append(reference, &symbol{Addr: e.Value, Size: e.Size, Name: e.Name})
+			}
+		}
+	}
+	reference.sort()
+	index := newELFIndex(f)
+	if index == nil {
 		t.Skip("requires ELF64")
 	}
 	defer f.Close()

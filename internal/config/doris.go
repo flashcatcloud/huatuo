@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"huatuo-bamai/internal/storage/driver"
+	"github.com/ccfos/huatuo/internal/storage/driver"
 )
 
 // Group commit modes accepted by GroupCommit.
@@ -41,7 +41,7 @@ type DorisConfig struct {
 
 	// PartitionField is the time field tables are range-partitioned on;
 	// empty creates a single ever-growing partition.
-	PartitionField string `default:"uploaded_time"`
+	PartitionField string `default:"uploaded_timestamp"`
 	RetentionDays  int    `default:"30"`
 
 	Buckets  int `default:"4"`
@@ -59,12 +59,12 @@ type DorisConfig struct {
 }
 
 // Enabled reports whether both endpoints opt in to Doris.
-func (c DorisConfig) Enabled() bool {
+func (c *DorisConfig) Enabled() bool {
 	return strings.TrimSpace(c.MySQLAddr) != "" && strings.TrimSpace(c.HTTPAddr) != ""
 }
 
 // Validate accepts either both endpoints or neither.
-func (c DorisConfig) Validate() error {
+func (c *DorisConfig) Validate() error {
 	mysqlSet := strings.TrimSpace(c.MySQLAddr) != ""
 	httpSet := strings.TrimSpace(c.HTTPAddr) != ""
 
@@ -72,15 +72,15 @@ func (c DorisConfig) Validate() error {
 		return nil
 	}
 	if !mysqlSet || !httpSet {
-		return fmt.Errorf("Doris MySQLAddr and HTTPAddr must be set together")
+		return fmt.Errorf("doris MySQLAddr and HTTPAddr must be set together")
 	}
 	if strings.TrimSpace(c.Database) == "" {
-		return fmt.Errorf("Doris Database must not be empty")
+		return fmt.Errorf("doris Database must not be empty")
 	}
 	switch strings.TrimSpace(c.GroupCommit) {
 	case "", groupCommitOff, groupCommitSync, groupCommitAsync:
 	default:
-		return fmt.Errorf("Doris GroupCommit %q must be %s, %s or %s",
+		return fmt.Errorf("doris GroupCommit %q must be %s, %s or %s",
 			c.GroupCommit, groupCommitOff, groupCommitSync, groupCommitAsync)
 	}
 
@@ -88,7 +88,7 @@ func (c DorisConfig) Validate() error {
 }
 
 // DriverConfig renders the storage driver configuration for this section.
-func (c DorisConfig) DriverConfig() *driver.Config {
+func (c *DorisConfig) DriverConfig() *driver.Config {
 	return &driver.Config{
 		Driver:                    "doris",
 		DorisMySQLAddr:            strings.TrimSpace(c.MySQLAddr),

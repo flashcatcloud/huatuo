@@ -10,8 +10,6 @@ import (
 	"sort"
 )
 
-type symbolLookup interface{ resolve(uint64) string }
-
 type elfEntry struct {
 	addr, size uint64
 	name       uint32
@@ -28,13 +26,9 @@ type compactELF struct {
 
 // Keep the full symbol order (including aliases) but read names only for PCs
 // actually sampled. Unsupported layouts retain debug/elf's decoding.
-func newELFIndex(f *elf.File) symbolLookup {
-	fallback := func() symbolLookup {
-		defer f.Close()
-		return elfSymbols(f)
-	}
+func newELFIndex(f *elf.File) *compactELF {
 	if f.Class != elf.ELFCLASS64 {
-		return fallback()
+		return nil
 	}
 	idx := &compactELF{file: f, names: make(map[int]string)}
 	types := [...]elf.SectionType{elf.SHT_DYNSYM, elf.SHT_SYMTAB}
@@ -45,13 +39,16 @@ func newELFIndex(f *elf.File) symbolLookup {
 			continue
 		}
 		if s.Entsize != 24 || s.Size%24 != 0 || uint64(s.Link) >= uint64(len(f.Sections)) {
-			return fallback()
+			return nil
 		}
 		names := f.Sections[s.Link]
 		if names.Type != elf.SHT_STRTAB || names.Flags&elf.SHF_COMPRESSED != 0 {
-			return fallback()
+			return nil
 		}
 		idx.tables[i] = names
+		if s.Size/24 > (2<<20)-capacity {
+			return nil
+		}
 		capacity += s.Size / 24
 	}
 	// Bound the initial allocation even for files with misleading section sizes.
@@ -90,7 +87,7 @@ func (idx *compactELF) resolve(pc uint64) string {
 		return ""
 	}
 	e := idx.entries[i]
-	if e.size != 0 && pc-e.addr >= e.size {
+	if !symbolCovers(e.addr, e.size, pc) {
 		return ""
 	}
 	if s, ok := idx.names[i]; ok {
@@ -103,7 +100,7 @@ func (idx *compactELF) resolve(pc uint64) string {
 	}
 	var buf [256]byte
 	var name []byte
-	for off < table.Size {
+	for off < table.Size && len(name) < 1<<20 {
 		n, err := table.ReadAt(buf[:min(uint64(len(buf)), table.Size-off)], int64(off))
 		if end := bytes.IndexByte(buf[:n], 0); end >= 0 {
 			s := string(append(name, buf[:end]...))

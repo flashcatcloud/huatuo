@@ -1277,6 +1277,24 @@ huatuo_bamai_diskio_disk_iowait_percent{host="hostname",region="dev"} 50
 |disk_iowait_percent|采集区间内 CPU 等待 I/O 完成的时间占比|百分比|宿主|host, region|
 
 
+### XFS 文件系统统计
+
+`xfs` 从 sysfs 采集每设备统计，指标前缀为 `huatuo_bamai_xfs_`，标签为
+`device`、`host`、`region`。`log_free_bytes` 为 Gauge，`_total` 为累积 Counter。
+
+|指标后缀|意义|单位|
+|---|---|---|
+|log_free_bytes|log 剩余可用空间|字节|
+|log_space_sleep_total|等待 log 空间的累计次数|计数|
+|alloc_blocks_total|累计分配 block 数|块|
+|alloc_extents_total|累计分配 extent 数|计数|
+|inode_attempts_total|inode cache 累计请求数|计数|
+|inode_missed_total|inode cache 累计 miss 数|计数|
+|buf_busy_locked_total|buffer busy-locked 累计次数|计数|
+|buf_locked_waited_total|等待 buffer 锁的累计次数|计数|
+
+无法获取 log 可用空间时不输出 `log_free_bytes`。新增 XFS 挂载后需重启 daemon。
+
 ## 通用系统
 
 ### Soft Lockup
@@ -1335,3 +1353,48 @@ huatuo_bamai_hungtask_total{host="hostname",region="dev"} 0
 |metax_gpu_dpm_performance_level|GPU DPM 性能等级|-|gpu, die, ip|sml.GetDieDPMPerformanceLevel|
 |metax_gpu_ecc_memory_errors_total|GPU ECC 内存错误次数|计数|gpu, die, memory_type, error_type|sml.GetDieECCMemoryInfo|
 |metax_gpu_ecc_memory_retired_pages_total|GPU ECC 内存退役页数|计数|gpu, die|sml.GetDieECCMemoryInfo|
+
+- 摩尔线程 (MThreads)
+
+摩尔线程 GPU 监控通过 MTML（摩尔线程管理库）实现。库文件在启动时通过 SONAME 搜索（`libmtml.so.2` 然后 `libmtml.so`）自动发现。静态设备信息会被缓存，仅在重新初始化时重建；动态指标在每次抓取时采集。
+
+配置：从 `BlackList` 中移除 `mthreads_gpu` 以启用。指标组由 `[MetricCollector.Mthreads]` 开关控制（`EnableHealth`、`EnablePCIe`、`EnableMTLink`）。
+
+|指标|描述|单位|标签|来源|
+|----|---|---|---|---|
+|huatuo_bamai_mthreads_gpu_library_info|MTML 库信息|-|version|mtml.LibraryVersion|
+|huatuo_bamai_mthreads_gpu_device_info|GPU 信息|-|gpu, name, brand, serial|mtml.Device.Name/Brand/SerialNumber|
+|huatuo_bamai_mthreads_gpu_device_pci_info|GPU PCI 信息|-|gpu, sbdf|mtml.Device.PciSbdf|
+|huatuo_bamai_mthreads_gpu_device_spec|GPU 规格|-|gpu, cores|mtml.Device.GpuCores|
+|huatuo_bamai_mthreads_gpu_device_bios_version|GPU BIOS 版本|-|gpu, bios|mtml.Device.BiosVersion|
+|huatuo_bamai_mthreads_gpu_device_musa_capability|GPU MUSA 计算能力|-|gpu, musa_capability|mtml.Device.MusaComputeCapability|
+|huatuo_bamai_mthreads_gpu_memory_info|GPU 内存信息|-|gpu, type, vendor, bus_width|mtml.Device.InitMemory|
+|huatuo_bamai_mthreads_gpu_pcie_link_max_speed_gt_per_sec|GPU PCIe 最大链路速率（硬件能力）|GT/s|gpu|mtml.Device.PciInfo|
+|huatuo_bamai_mthreads_gpu_pcie_link_max_width_lanes|GPU PCIe 最大链路宽度（硬件能力）|lanes|gpu|mtml.Device.PciInfo|
+|huatuo_bamai_mthreads_gpu_device_power_watts|GPU 设备功耗|W|gpu|mtml.Device.PowerUsage|
+|huatuo_bamai_mthreads_gpu_gpu_temperature_celsius|GPU 温度|°C|gpu|mtml.Gpu.Temperature|
+|huatuo_bamai_mthreads_gpu_memory_temperature_celsius|GPU 内存温度|°C|gpu|mtml.Memory.Temperature|
+|huatuo_bamai_mthreads_gpu_gpu_utilization_percent|GPU 利用率（0-100）|%|gpu|mtml.Gpu.Utilization|
+|huatuo_bamai_mthreads_gpu_memory_utilization_percent|GPU 内存利用率（0-100）|%|gpu|mtml.Memory.Utilization|
+|huatuo_bamai_mthreads_gpu_memory_total_bytes|GPU 总内存|bytes|gpu|mtml.Memory.Total|
+|huatuo_bamai_mthreads_gpu_memory_used_bytes|GPU 已使用内存|bytes|gpu|mtml.Memory.Used|
+|huatuo_bamai_mthreads_gpu_gpu_clock_mhz|GPU 时钟频率|MHz|gpu|mtml.Gpu.Clock|
+|huatuo_bamai_mthreads_gpu_gpu_max_clock_mhz|GPU 最大时钟频率|MHz|gpu|mtml.Gpu.MaxClock|
+|huatuo_bamai_mthreads_gpu_memory_clock_mhz|GPU 内存时钟频率|MHz|gpu|mtml.Memory.Clock|
+|huatuo_bamai_mthreads_gpu_memory_max_clock_mhz|GPU 内存最大时钟频率|MHz|gpu|mtml.Memory.MaxClock|
+|huatuo_bamai_mthreads_gpu_gpu_voltage_volts|GPU 电压|V|gpu|mtml.Gpu.Voltage|
+|huatuo_bamai_mthreads_gpu_gpu_power_limit_watts|GPU 强制功耗限制|W|gpu|mtml.Gpu.EnforcedPowerLimit|
+|huatuo_bamai_mthreads_gpu_gpu_power_default_limit_watts|GPU 默认功耗管理限制|W|gpu|mtml.Gpu.PowerManagementDefaultLimit|
+|huatuo_bamai_mthreads_gpu_fan_rpm|GPU 风扇转速|RPM|gpu, fan|mtml.Device.FanRpm|
+|huatuo_bamai_mthreads_gpu_fan_speed_percent|GPU 风扇速度百分比|%|gpu, fan|mtml.Device.FanSpeed|
+|huatuo_bamai_mthreads_gpu_gpu_pstate|GPU 性能状态（0=P0）|-|gpu|mtml.Device.PerformanceState|
+|huatuo_bamai_mthreads_gpu_vpu_utilization_percent|GPU VPU 利用率（0-100）|%|gpu|mtml.Vpu.Utilization|
+|huatuo_bamai_mthreads_gpu_vpu_encoder_utilization_percent|GPU VPU 编码器利用率（0-100）|%|gpu|mtml.Vpu.Utilization|
+|huatuo_bamai_mthreads_gpu_vpu_decoder_utilization_percent|GPU VPU 解码器利用率（0-100）|%|gpu|mtml.Vpu.Utilization|
+|huatuo_bamai_mthreads_gpu_vpu_clock_mhz|GPU VPU 时钟频率|MHz|gpu|mtml.Vpu.Clock|
+|huatuo_bamai_mthreads_gpu_pcie_link_speed_gt_per_sec|GPU PCIe 当前链路速率|GT/s|gpu|mtml.Device.PciInfo|
+|huatuo_bamai_mthreads_gpu_pcie_link_width_lanes|GPU PCIe 当前链路宽度|lanes|gpu|mtml.Device.PciInfo|
+|huatuo_bamai_mthreads_gpu_pcie_replay_total|GPU PCIe 重放计数器|count|gpu|mtml.Device.PcieReplayCounter|
+|huatuo_bamai_mthreads_gpu_mtlink_state|GPU MtLink 状态（0=DOWN,1=UP,2=DOWNGRADE）|-|gpu, link|mtml.Device.MtLinkState|
+|huatuo_bamai_mthreads_gpu_mtlink_link_bandwidth_gb_s|GPU MtLink 每链路最大带宽（设备静态规格，非实时吞吐）|GB/s|gpu|mtml.Device.MtLinkSpec|
+|huatuo_bamai_mthreads_gpu_mtlink_link_count|GPU MtLink 最大支持链路数（设备静态规格）|links|gpu|mtml.Device.MtLinkSpec|

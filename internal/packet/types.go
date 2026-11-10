@@ -21,10 +21,10 @@ import (
 	"strings"
 )
 
-// RawCapacity is the size of the raw packet buffer, matching PKT_RAW_LEN in bpf/dropwatch.c.
+// RawCapacity is the size of the raw packet buffer, matching PKT_RAW_LEN in bpf/net_dropwatch.c.
 const RawCapacity = 120
 
-// Hdr mirrors struct packet_hdr in bpf/dropwatch.c.
+// Hdr mirrors struct packet_hdr in bpf/net_dropwatch.c.
 type Hdr struct {
 	EthProto  uint16
 	RawLen    uint8
@@ -103,11 +103,14 @@ type TCP struct {
 	Seq        uint32 `json:"seq"`
 	AckSeq     uint32 `json:"ack_seq"`
 	DataOffset uint8  `json:"data_offset"`
-	Flags      string `json:"flags"`
-	Window     uint16 `json:"window"`
-	Checksum   uint16 `json:"checksum"`
-	Urgent     uint16 `json:"urgent,omitempty"`
-	SkState    string `json:"sk_state,omitempty"`
+	// Flags preserves the JSON representation while RawFlags retains the same
+	// byte for protocol logic without exposing duplicate state on the wire.
+	Flags    string `json:"flags"`
+	RawFlags uint8  `json:"-"`
+	Window   uint16 `json:"window"`
+	Checksum uint16 `json:"checksum"`
+	Urgent   uint16 `json:"urgent,omitempty"`
+	SkState  string `json:"sk_state,omitempty"`
 }
 
 // UDP holds L4 UDP fields.
@@ -120,8 +123,9 @@ type UDP struct {
 
 // ICMP is shared between ICMPv4 and ICMPv6: the L3 layer (IPv4 vs IPv6)
 // is the discriminator. Type is gopacket's pre-rendered TypeCode string
-// (e.g. "EchoRequest"); Code is the raw code byte. ID/Seq carry the ICMPv4
-// echo fields when present; ICMPv6 packets populate only Type/Code/Checksum.
+// (e.g. "EchoRequest"); Code is the raw code byte. ICMPv6 Echo requests and
+// replies fill ID/Seq only after their complete Echo header is decoded.
+// Zero values retain the existing JSON/text omission behavior.
 type ICMP struct {
 	Type     string `json:"type"`
 	Code     uint8  `json:"code"`

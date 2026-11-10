@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build !didi
+
 package bpf
 
 import (
@@ -28,7 +30,7 @@ import (
 	"testing"
 	"time"
 
-	testutils "huatuo-bamai/internal/testing"
+	testutils "github.com/ccfos/huatuo/internal/testing"
 
 	"github.com/cilium/ebpf"
 	"github.com/stretchr/testify/assert"

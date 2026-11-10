@@ -23,12 +23,12 @@ The configuration file uses **TOML** format and includes multiple sections such 
 # - BlackList
 # Global blacklist for tracing and metrics.
 #
-BlackList = ["netdev_hw", "metax_gpu", "ascend_npu", "diskio", "tcp_retransmit"]
+BlackList = ["netdev_hw", "netdev_qdisc", "metax_gpu", "ascend_npu", "diskio", "tcp_retransmit", "mthreads_gpu"]
 ```
 
 - **BlackList**: Global blacklist for tracing and metrics.
 
-  Modules or hardware to exclude from tracing and metric collection. The default is `["netdev_hw", "metax_gpu", "ascend_npu", "diskio", "tcp_retransmit"]`, which disables tracing and metrics for the network device hardware layer, Metax GPU, Ascend NPU, procfs-based disk I/O statistics, and TCP retransmission tracing. Remove `diskio` to enable disk I/O metrics or `tcp_retransmit` to enable TCP retransmission tracing and its drop-correlation cache. Supports arrays; extend as needed.
+  Modules or hardware to exclude from tracing and metric collection. The default is `["netdev_hw", "netdev_qdisc", "metax_gpu", "ascend_npu", "diskio", "tcp_retransmit", "mthreads_gpu"]`, which disables tracing and metrics for the network device hardware layer, qdisc statistics, Metax GPU, Ascend NPU, procfs-based disk I/O statistics, TCP retransmission tracing, and Moore Threads GPU. Remove `diskio` to enable disk I/O metrics, `tcp_retransmit` to enable TCP retransmission tracing, or `mthreads_gpu` to enable Moore Threads GPU metric collection on hosts with MT GPUs. Local correlation does not require the standalone `dropwatch` tracer. Supports arrays; extend as needed.
 
 ### 3. Logging
 
@@ -90,7 +90,7 @@ Huatuo does not create its own cgroup by default. This section applies only when
 The configured values remain in their documented units. Memory is converted
 to bytes only when the cgroup limit is applied.
 
-### 5. HTTP Server and Tasks
+### 5. HTTP Server and On-demand Operations
 
 ```toml
 # HTTP server configuration.
@@ -117,18 +117,77 @@ to bytes only when the cgroup limit is applied.
     # MaxEventStreamClients = 100
     # EventStreamKeepAliveIntervalSeconds = 30
 
-# Locally running tracing tasks.
-[Tasks]
-    # - MaxConcurrent
-    # Maximum number of concurrent tasks.
-    # Default: 10
-    #
+[HTTPServer.Auth]
+    # Required service credential used by huatuo-apiserver.
+    BearerToken = "REPLACE_WITH_RANDOM_HEX"
+
+# Shared lifecycle policy for Profiling and Tracing operations.
+[Operations]
     # MaxConcurrent = 10
+    # LaunchTimeoutSeconds = 10
+    # StopGracePeriodSeconds = 5
+    # FinalizationTimeoutSeconds = 30
+    # TerminalRetentionPeriodSeconds = 600
+
+# Node-local profiler execution settings.
+[Profiling]
+    # AggregationIntervalSeconds = 10
+    # MaxConcurrentProcesses = 10
+    # CommandOutputLimitBytes = 65536
+    # ToolDir = "/opt/huatuo/tools"
+
 ```
 
 - **ListenAddress** uses `host:port` form. An empty host listens on all
   interfaces.
-- **MaxConcurrent** limits locally running tracing tasks.
+- **HTTPServer.Auth.BearerToken** is required and must match the independent
+  Node credential configured for huatuo-apiserver. Replace the example value
+  before deployment.
+- **Operations.MaxConcurrent** is one process-wide limit shared by Profiling
+  and Tracing. New operations are rejected instead of queued when it is full.
+- The four operation time settings independently limit process launch,
+  graceful stop, result finalization, and terminal-state retention.
+- **Profiling.ToolDir** is the shared external tool root, passed unchanged as
+  profiler `--tool-path`. Java requires `bin/asprof` and
+  `lib/libasyncProfiler.so` beneath this root; Python requires
+  `py-spy`. Only the requested language's tools are checked. Native profiling
+  does not require this setting. Unsupported node environments reject the request
+  without creating an operation.
+
+The generated Node API exposes its contract at `GET /openapi.json`. Profiling
+and Tracing Start, Get, and Stop routes, `POST /v1/events/watch`, and
+`PUT /v1/config` require the service bearer token. `/readyz`, metrics, version,
+and the OpenAPI document remain public.
+
+#### 5.1 Update Configuration through the Node API
+
+`PUT /v1/config` accepts one non-empty `config` object. Keys use the same
+dot-separated paths as the TOML structure, while values retain their JSON
+types:
+
+```bash
+curl -i -X PUT 'http://127.0.0.1:19704/v1/config' \
+  -H 'Authorization: Bearer REPLACE_WITH_RANDOM_HEX' \
+  -H 'Content-Type: application/json' \
+  --data '{
+    "config": {
+      "BlackList": ["dropwatch", "netdev_hw"],
+      "Runtime.CPULimitCores": 1.5,
+      "Runtime.MemoryLimitMiB": 1024
+    }
+  }'
+```
+
+A successful update returns `204 No Content`. The Node Agent validates the
+complete candidate configuration, atomically replaces the configuration file,
+and only then publishes the new in-memory snapshot. Validation or persistence
+failure leaves the current snapshot unchanged. Unknown keys, invalid value
+types, and empty update objects return `400 Bad Request`.
+
+Components that read configuration dynamically can observe the new snapshot
+without a restart. Settings consumed during startup, including the HTTP
+listener and authentication, storage initialization, and cgroup setup, are
+persisted but take effect only after restarting `huatuo-bamai`.
 
 The event stream settings control `POST /v1/events/watch`. When
 `MaxEventStreamClients` is reached, new streams receive HTTP 429.
@@ -249,6 +308,18 @@ idle timeout; 15–60 seconds is typical.
 
 #### 6.3 Doris Storage
 
+On the current schema, tables use `uploaded_timestamp` and
+`profile_data.profile_type`; databases created by the earlier experimental
+Doris backend are not migrated automatically. Use a fresh database when upgrading.
+Profiling publication markers use a separate unpartitioned table. They are not
+removed by the result tables' dynamic partition retention policy.
+Synchronous profile writes and publication markers bypass async group commit
+and wait up to one minute for the exact payload to become query-visible.
+Conditional writes and counted query deletion return an unsupported-operation
+error; this backend is intended for profiling results and tracing events,
+not the job-state store.
+
+
 ```bash
 [Storage.Doris]
     # MySQLAddr = "127.0.0.1:9030"
@@ -256,7 +327,7 @@ idle timeout; 15–60 seconds is typical.
     # Database = "huatuo_bamai"
     # Username = "root"
     # Password = "REPLACE_WITH_PASSWORD"
-    # PartitionField = "uploaded_time"
+    # PartitionField = "uploaded_timestamp"
     # RetentionDays = 30
     # Buckets = 4
     # Replicas = 1
@@ -266,7 +337,7 @@ idle timeout; 15–60 seconds is typical.
     # MaxRetries = 3
 ```
 
-The Doris backend serves the same purpose as ES/OS storage: persisting kernel tracing, event and profiling data. Both may be configured at once, in which case data is written to both.
+The Doris backend serves the same purpose as ES/OS storage: persisting kernel tracing, event and profiling data. When both are configured, tracing events are written to both. Profiling windows and publication markers use Doris in preference to Elasticsearch.
 
 Queries use the MySQL protocol (FE query port) and writes use Stream Load (FE HTTP port), so both addresses are required. Tables are created automatically on first start.
 
@@ -294,7 +365,7 @@ Queries use the MySQL protocol (FE query port) and writes use Stream Load (FE HT
 
 - **PartitionField**: Field the table is partitioned on.
 
-  Default: uploaded_time.
+  Default: uploaded_timestamp.
 
   **Note**: Tables are range-partitioned by day on this field, which **must be an indexed time field**; anything else fails startup. Leaving it empty disables partitioning, which lets a single partition grow without bound and forfeits both partition pruning and time-based retention. Only suitable for testing.
 
@@ -715,7 +786,115 @@ This module detects sudden memory usage spikes on the host and automatically cap
 
   Default: 10.
 
-#### 7.6 Known Issue Filtering (IssuesList)
+#### 7.6 Memory Threshold Runtime Snapshots
+
+`memory_threshold_snapshot` is enabled by default. Add it to the global `BlackList`
+and restart huatuo-bamai to disable it.
+This feature attempts a Go, HotSpot, or CPython snapshot
+after a container memory-pressure notification; completion before OOM is not
+guaranteed. Candidates are ranked by an approximate kernel OOM score.
+
+The persisted `victim_pid`, `victim_process_name`, and `victim_oom_score_adj`
+fields describe the process selected for snapshot capture.
+
+```toml
+[AutoTracing.MemoryThresholdSnapshot]
+    # ThresholdPercent = 90
+    # IntervalTracing = 300
+    # RunTracingToolTimeout = 2
+    # MaxMemoryObjectEntries = 10
+```
+
+Commented values are defaults.
+
+| Parameter | Meaning |
+|-----------|---------|
+| ThresholdPercent | Required memory usage-to-limit percentage, from 1 to 100 |
+| IntervalTracing | Node-wide minimum interval after a successful or failed capture attempt, in seconds; defaults to 300 and must be positive |
+| RunTracingToolTimeout | Cooperative capture timeout shared by Go, Java, and Python, in seconds; defaults to 2 and must be positive |
+| MaxMemoryObjectEntries | Maximum number of ranked memory object entries in a snapshot, from 1 to 100; defaults to 10; final JSON is trimmed to at most 512 KiB |
+
+Runtime detection and persistence are not included in the capture budget.
+Runtime detection has no separate timeout. Timeouts cannot interrupt synchronous reads
+already executing, so they do not bound the total operation time.
+
+**Trigger conditions:**
+
+- **Cgroup v1**: Registers the memory threshold corresponding to
+  `ThresholdPercent` through `cgroup.event_control`.
+- **Cgroup v2**: Watches increases in the `high` or `max` counters of
+  `memory.events.local` (falling back to `memory.events` when absent), then
+  checks `memory.current / memory.max` against the configured percentage.
+  This feature does not set `memory.high`. When it is `max`, the hard-limit
+  `max` counter can still trigger a check. This is a late notification and
+  does not guarantee detection at the configured percentage or before OOM.
+
+Both versions check usage once after registration and when the hard limit
+changes. One watcher manages all targets without periodic sampling. Repeated
+notifications for a target are coalesced; they do not count every crossing or
+report recovery below the threshold. Capture rechecks current usage and identity.
+
+This feature requires the pod manager. It actively maintains the container view
+from shared CSS lifecycle hints and supplies an initial view followed by events
+with instance generations, init PIDs, and memory cgroup paths. The snapshot module
+no longer scans the cgroup tree. Subscription overflow recovers from a complete
+pod view; synchronization failure suspends capture and never implies deletion.
+
+Running ordinary containers and restartable init sidecars are monitored;
+ephemeral debug containers and ordinary init containers are excluded. Ordinary
+registration errors and target capacity exhaustion are logged and the directory
+instance is skipped. Invalidated registrations are removed without automatic
+retries or backfilling. Repeated events, full views, and container generation changes
+do not restore a failed watch. A replacement directory, a new tracking lifetime
+after the previous container departs, or a huatuo-bamai restart allows a new attempt.
+Fatal errors such as host resource exhaustion still stop the current watcher.
+Each monitored container must have its own memory cgroup directory. A watch
+and its capture observations bind directly to one container instance. If registration
+returns a watch already owned by another container, the feature stops, cancels capture,
+and releases its watches. Correct the cgroup isolation and restart huatuo-bamai;
+the feature does not retry this conflict. Directory replacement invalidates the old
+registration through the watcher's removal notification.
+Before capture and saving, the feature verifies the container generation and live
+binding, directory identity, and selected process identity and cgroup membership.
+Recorded memory usage and limits belong to that container's cgroup.
+
+See section 14 for deployment limitations and output lookup.
+
+#### 7.7 IRQTracing AutoTracing
+
+This module detects abnormal irq+softirq utilization on one CPU and invokes
+`irqtracing` to collect softirq source and victim stacks.
+
+```bash
+[AutoTracing.IRQTracing]
+    Interval = 2
+    RunTracingToolTimeout = 3
+    IntervalTracing = 300
+    MaxEventsPerSecond = 1000
+    MinCPUs = 3
+    DeltaUsageThreshold = 20
+    RelativeIncreaseThreshold = 30
+    SustainedIntervals = 10
+    UsageThreshold = 80
+```
+
+- **Interval**: Sampling interval for per-CPU irq+softirq utilization from
+  `/proc/stat`. Default: 2s.
+- **RunTracingToolTimeout**: Duration of one `irqtracing` collection. Default:
+  3s.
+- **IntervalTracing**: Minimum interval between triggers. Default: 300s.
+- **MaxEventsPerSecond**: Combined source and victim stack-sample limit per
+  second on the traced CPU. Default: 1000. The daemon divides it as evenly as
+  possible between `softirq_raise` and `softirq_entry`; the default is 500
+  events/s per stream. The value must be between 2 and 8589934590.
+- **MinCPUs**, **DeltaUsageThreshold**, and **RelativeIncreaseThreshold**:
+  Configure the multi-CPU irq+softirq spike rule. The two thresholds are the
+  increase in percentage points and the increase relative to the previous
+  sample, respectively.
+- **SustainedIntervals** and **UsageThreshold**: Configure the consecutive
+  sample count and utilization threshold for the single-CPU sustained rule.
+
+#### 7.8 Known Issue Filtering (IssuesList)
 
 ```bash
 # Autotracing configuration.
@@ -865,7 +1044,7 @@ This section captures key kernel events and latency, including scheduler tick in
 
 ```toml
 [EventTracing.Dropwatch]
-    # tcpdump-style filter expression, forwarded to dropwatch --filter.
+    # Filter for standalone dropwatch.
     # Default: "tcp"
     Filter = "tcp"
 
@@ -879,7 +1058,7 @@ This section captures key kernel events and latency, including scheduler tick in
     ExcludeContainers = []
 ```
 
-- **Filter**: tcpdump-style packet filter passed to `dropwatch --filter` and applied by the BPF program before events are emitted.
+- **Filter**: tcpdump-style packet filter passed only to standalone dropwatch. TCP retransmission correlation uses `TCPRetransmit.Filter` for both of its inputs.
 
   Default: `"tcp"`.
 
@@ -895,28 +1074,30 @@ This section captures key kernel events and latency, including scheduler tick in
 
 ```bash
 [EventTracing.TCPRetransmit]
-    # Forwarded to tcpshark --filter.
-    # Applies only to tcp_retransmit_skb events.
-    # Default: ""
+    # Retransmission filter. Local correlation applies it to both inputs.
+    # Default: empty (no flag when disabled; "tcp" when enabled).
     Filter = ""
 
     # Forwarded as tcpshark --enable-tlp. Default: false.
     EnableTLP = false
+
+    # Run tcpshark with an embedded dropwatch source. Default: false.
+    EnableDropwatch = false
 
     # Forwarded as tcpshark --max-events-per-second.
     # Default: 100; 0 disables rate limiting.
     MaxEventsPerSecond = 100
 ```
 
-- **Filter**: tcpdump-style filter expression passed to `tcpshark --filter`.
-
-  Default: empty string. It applies only to `tcp_retransmit_skb` events.
-
 - **EnableTLP**: Whether to collect `tcp_send_loss_probe` events.
 
   Default: false.
 
-- **MaxEventsPerSecond**: Maximum TCP retransmission events emitted by BPF per second.
+- **Filter**: Tcpdump-style retransmission filter used in both modes. Local correlation applies the normalized expression to both tcpshark inputs and defaults an empty value to `tcp`. When correlation is disabled, an empty value passes no `--filter` flag. `Dropwatch.Filter` independently controls standalone dropwatch.
+
+- **EnableDropwatch**: Whether tcpshark should load a private dropwatch source and finalize retransmissions locally. The default is false. `tcp_retransmit` must be removed from `BlackList`; standalone `dropwatch` may remain blacklisted. Retransmissions wait up to 100 ms for delayed delivery, and candidate drops must precede them by no more than one second in kernel monotonic time. The embedded source automatically detects and enables devlink DROP traps. A strict same-namespace match reports `software` or `hardware` according to source, with the same `drop_source`, `drop_reason`, and hardware `drop_reason_group` semantics as dropwatch; every finalized event has one `correlation_reason` (`matched`, `unsupported`, `warmup`, `wait_timeout`, `queue_full`, or `interrupted`). `warmup` applies only to expired waits whose retransmit timestamp predates source readiness; retransmissions at or after readiness receive `wait_timeout` on expiry, and other termination paths retain their own reasons. Unmatched events report `drop_location=unknown` with the namespace diagnostic and dropwatch counters, including map-counter availability.
+
+- **MaxEventsPerSecond**: Maximum TCP retransmission events emitted by BPF per second. Correlation mode gives embedded dropwatch an independent limiter with the same value, so `100` permits up to 100 events/s on each input.
 
   Default: 100. Set to 0 for unlimited output. When the limit is exceeded, `tcpshark` logs `rate limit hit`.
 
@@ -944,7 +1125,25 @@ This section captures key kernel events and latency, including scheduler tick in
 
   **Description**: THR events are generated by the CPU's local-APIC threshold interrupt when correctable hardware errors accumulate. These can fire at very high frequency during hardware degradation. The backoff suppresses redundant saves while ensuring at least one record is captured per interval. Lower values provide more granular event records at the cost of higher storage throughput; in environments with frequent correctable errors, consider raising this value to reduce noise.
 
-#### 8.8 Known Issue Filtering (IssuesList)
+#### 8.8 Moore Threads GPU Event Tracing (EventTracing.MthreadsGPU)
+
+```bash
+# mthreads_gpu
+#
+# Moore Threads GPU XID error event tracing.
+[EventTracing.MthreadsGPU]
+    # MthreadsXidLevel = ""
+```
+
+- **MthreadsXidLevel**: Minimum severity level for XID error reporting.
+
+  Valid values: `""` (disabled), `"notify"`, `"warning"`, `"fatal"`.
+
+  Default: `""` (disabled).
+
+  **Description**: Controls which XID error events are reported. Set to enable XID error tracking for Moore Threads GPUs. XID errors below the specified severity level are filtered out. To enable this feature, ensure that `mthreads_xid` is removed from the global `BlackList` (if present) and set this field to one of the valid severity levels (`"notify"`, `"warning"`, `"fatal"`). Additionally, the MUSA driver must be installed on the host. The feature polls `/proc/driver/musa/gpu*/event_report` files every second to capture XID error events. Each XID event contains detailed information including UUID, XID ID, severity, scope, PCI BDF, process ID, and additional context.
+
+#### 8.9 Known Issue Filtering (IssuesList)
 
 ```bash
 # Linux kernel event tracing configuration.
@@ -1104,6 +1303,54 @@ This section defines collection rules for various system and network metrics. Al
 
 - **MountPointsIncluded**: Regex for mount points to collect. Default includes /, /home, /boot.
 
+#### 9.7 Moore Threads GPU Metrics
+
+```bash
+# MetricCollector.Mthreads
+#
+# Moore Threads GPU metric collection via the MTML (Moore Threads Management
+# Library) shared library. The library is discovered automatically at startup
+# using SONAME search (libmtml.so.2, then libmtml.so) through the system
+# dynamic linker; no hardcoded path is required.
+#
+# Remove "mthreads_gpu" from BlackList to enable this collector.
+#
+# - EnableHealth
+# Enable health metrics: temperature, power, utilization, clocks, fans, pstate, VPU.
+# Default: true
+#
+# - EnablePCIe
+# Enable PCIe link metrics: current speed/width and replay counter.
+# Default: false
+#
+# - EnableMTLink
+# Enable MtLink interconnect metrics: per-link state and bandwidth.
+# Default: false
+#
+[MetricCollector.Mthreads]
+    # EnableHealth = true
+    # EnablePCIe = false
+    # EnableMTLink = false
+```
+
+- **EnableHealth**: Controls collection of health-related metrics.
+
+  Default: true. When enabled, collects: GPU/memory temperature (`gpu_temperature_celsius`, `memory_temperature_celsius`), power usage and limits (`device_power_watts`, `gpu_power_limit_watts`, `gpu_power_default_limit_watts`), GPU/memory utilization (`gpu_utilization_percent`, `memory_utilization_percent`), clock frequencies (`gpu_clock_mhz`, `gpu_max_clock_mhz`, `memory_clock_mhz`, `memory_max_clock_mhz`), voltage (`gpu_voltage_volts`), memory capacity (`memory_total_bytes`, `memory_used_bytes`), fan speed (`fan_rpm`, `fan_speed_percent`), performance state (`gpu_pstate`), and VPU metrics (`vpu_utilization_percent`, `vpu_encoder_utilization_percent`, `vpu_decoder_utilization_percent`, `vpu_clock_mhz`).
+
+- **EnablePCIe**: Controls collection of PCIe link metrics.
+
+  Default: false. When enabled, collects: current PCIe link speed and width (`pcie_link_speed_gt_per_sec`, `pcie_link_width_lanes`), max capability (`pcie_link_max_speed_gt_per_sec`, `pcie_link_max_width_lanes`), and replay counter (`pcie_replay_total`).
+
+- **EnableMTLink**: Controls collection of MtLink interconnect metrics.
+
+  Default: false. When enabled, collects: device-level static specs (per-link bandwidth `mtlink_link_bandwidth_gb_s` and link count `mtlink_link_count`) and per-link state (`mtlink_state`).
+
+**Library discovery**: At startup, the collector searches for `libmtml.so.2` then `libmtml.so` via the system dynamic linker (respecting `LD_LIBRARY_PATH` and `/etc/ld.so.cache`). If no library is found, the collector logs a warning and is disabled for the lifetime of the process. Library discovery is performed only at startup: changing `LD_LIBRARY_PATH` or installing a new MTML version also requires a restart.
+
+**Hot-reload semantics**: `EnableHealth`, `EnablePCIe`, and `EnableMTLink` are read from the latest config snapshot on every scrape, so toggling them takes effect on the next Prometheus scrape without restarting `huatuo-bamai`. A `false → true → false` transition emits and suppresses the corresponding metric groups on the next scrape after each change.
+
+Note: enabling the collector itself (i.e. removing `mthreads_gpu` from `BlackList` after the process has already started with the collector disabled because `libmtml.so` was missing at startup) requires a restart. The collector factory runs only during initialization, so a successful late library load will not register a new collector.
+
 ### 10. Pod
 
 This section configures how to fetch Pod information from kubelet to enable container/Pod-level labeling and metric isolation.
@@ -1203,3 +1450,175 @@ Specific rules:
 By properly configuring huatuo-bamai.conf, you can fully leverage HUATUO’s capabilities in kernel-level anomaly detection and intelligent tracing, significantly improving observability and troubleshooting efficiency in cloud-native systems.
 
 If you need deeper customization for a specific scenario, feel free to provide more details about your environment.
+
+### 14. Memory Threshold Snapshot Deployment and Troubleshooting
+
+#### 14.1 Requirements and Limitations
+
+- Requires Linux, memory cgroup v1/v2, host PID/procfs/cgroup views,
+  kubelet metadata, kernel BTF, and BPF load/attach permissions.
+- Requires target-memory read permission (usually `CAP_SYS_PTRACE`),
+  procfs/cgroup access, and v1 `cgroup.event_control` write access.
+  Yama, SELinux, or AppArmor may block access.
+- Selects only direct cgroup members, excluding `oom_score_adj = -1000`.
+  Selection is skipped above 4096 PIDs, 64 KiB of PID data, or a one-second budget.
+- At most 4096 containers are watched. Targets come from pod events without
+  scanning the cgroup tree. Ordinary registration errors and capacity exhaustion
+  are logged and skipped; invalidated registrations are removed without retries
+  or backfilling. Resource recovery or a full view does not re-register the same
+  instance, so pressure monitoring may remain unavailable for that instance.
+- Failed identity checks or missing container metadata prevent capture or saving.
+- Process selection and capture both use `/proc` in Huatuo's PID namespace.
+  Changing `--procfs-prefix` does not redirect memory snapshot reads.
+
+This table describes experimental implementation coverage, not validation of
+every listed version:
+
+| Runtime | Experimental coverage | Main limitations |
+|---------|-----------------------|------------------|
+| Go | Go 1.18–1.26, 64-bit ELF | Instruction recovery for stripped executables is x86-64 only |
+| Java | Java 8+, little-endian 64-bit ELF HotSpot, G1 GC | Requires recognizable VMStruct/VMType metadata |
+| Python | CPython 3.8–3.14, little-endian 64-bit ELF | Requires discoverable `_PyRuntime` and recognizable version/layout |
+
+Recorded manual validation: x86-64 Linux, cgroup v1 (legacy/hybrid), Go 1.24.0.
+Verify pressure-triggered, non-empty snapshots in your environment;
+skipped tests and `unavailable` results do not prove compatibility.
+
+#### 14.2 Output and Troubleshooting
+
+Info logs record watcher state and capture attempts.
+Process selection and persistence details use Debug logs. Locate attempts by
+container/cgroup and use process-selection logs to identify the PID. Inspect
+stored snapshot `status` and `status_reason` fields for runtime diagnostics.
+If a capture attempt starts but does not finish, inspect bamai's
+`/debug/pprof/goroutine?debug=2` with appropriate authorization for the blocked stack.
+No logs alone do not prove that monitoring has stopped.
+
+`tracer_data.process_memory` reads `/proc/<pid>/status` once after runtime detection
+returns without error, including for unrecognized runtimes such as C/C++.
+Provider failures produce a `failed` snapshot and retain this summary.
+Detection or output-processing errors prevent persistence; inspect the capture
+attempt logs for the error. Target identity changes or cancellation discard the result.
+It provides no PSS, mapping rankings, or allocation stacks.
+
+| Field (bytes) | Source / meaning |
+|------|--------|
+| `virtual_bytes` | VmSize, virtual address space, not physical memory usage |
+| `rss_bytes` | VmRSS, resident memory |
+| `rss_anon_bytes` | RssAnon, anonymous resident memory |
+| `rss_file_bytes` | RssFile, file-backed resident memory |
+| `rss_shmem_bytes` | RssShmem, shared resident memory |
+| `swap_bytes` | VmSwap, swapped private anonymous memory, excluding shmem swap |
+| `page_table_bytes` | VmPTE, page-table memory |
+
+Missing/invalid fields are omitted, not zero-filled: status is `partial`,
+or `unavailable` with `status_reason` if nothing can be read.
+Values are approximate, not an OOM-time snapshot or proof of a leak.
+The selected process may not be the eventual OOM victim.
+
+Results use the existing `[Storage]` configuration (section 6); no separate
+storage setup is needed. The LocalFile filename is `memory_threshold_snapshot`.
+Query `tracing_documents` with `tracer_name = memory_threshold_snapshot` and
+`tracer_type = autotracing`.
+
+`started_timestamp` records when the capture attempt starts, before process selection.
+`observed_timestamp` records when snapshot collection starts, after process selection
+and before runtime detection.
+
+The `kind` and measurement semantics of `tracer_data.snapshot.entries` are:
+
+| Runtime | `kind` | `objects` | `bytes` |
+|---------|--------|-----------|---------|
+| Go | `inuse_space_objects` | Estimated unfreed object count from published statistics, corrected for sampling and grouped by complete allocation stack | Estimated unfreed bytes for those objects |
+| Java | `object_class` | Estimated instance count grouped by class | Estimated memory occupied by the objects themselves (shallow heap) |
+| Python | `gc_tracked_object_type` | GC-tracked object count grouped by type | Estimated shallow size of those objects |
+
+Go's `bytes` and `objects` correspond to pprof's `inuse_space` and `inuse_objects`
+metrics. Java does not compute retained heap; Python covers only GC-tracked
+objects, not the entire Python heap. Older records may use `allocation_site`
+for Go and `object_type` for Java; consumers reading historical records should
+accept those values.
+
+For Go entries, `name` remains the plain function name of the first non-runtime
+frame, or the first frame when all frames belong to the runtime. `stack` remains
+a string array ordered from the allocation site toward its callers. When both
+file and line are available, each frame uses `function, source_file:line`, with
+one space after the comma. For example:
+
+```json
+{
+  "kind": "inuse_space_objects",
+  "name": "example/cache.allocate",
+  "bytes": 131072,
+  "objects": 32,
+  "average_bytes": 4096,
+  "stack": [
+    "example/cache.allocate, example/cache/cache.go:123",
+    "example/service.load, example/service/load.go:58",
+    "main.main, example/cmd/server/main.go:42"
+  ]
+}
+```
+
+Locations come from the binary's Go line table; source files need not exist on
+the target machine. Paths retain their compiled values, which may reflect
+`-trimpath` and may not identify files on the target machine. A missing file or
+an invalid line leaves only the function name; an unresolved function leaves the
+hexadecimal PC. Consumers should also accept historical frames containing only
+names or addresses. Function names and paths may themselves contain commas, so
+splitting indiscriminately on commas is not reliable. Source locations identify
+allocation sites, not object owners, and do not guarantee a fully expanded
+inline call chain.
+
+Go subtracts frees from allocations using only the runtime's published `active`
+counters, then corrects for sampling. Unpublished `future[0..2]` counters are
+excluded. Publication is delayed until the corresponding GC sweep frees are
+accounted for, so recent allocation spikes may be absent. Results are external
+samples of the published heap profile, not heap usage at the trigger instant.
+Collection does not acquire runtime locks, flush counters, or trigger GC in the
+target. Fields or buckets may still reflect different publication stages, so
+the result does not provide pprof's atomic consistency.
+
+If a complete scan observes no nonzero `active` counters, it returns `unavailable`
+with `status_reason` set to `Go heap profile has no published statistics`, without
+falling back to `future`. This can occur before the first GC and does not mean
+that the process has no heap objects. Published counters whose sampled objects
+have all been freed can still produce `complete` with empty entries. An
+interrupted scan preserves `partial` and its reason rather than treating
+unobserved data as unpublished.
+
+Go aggregates complete stack keys up to 32 frames for Go 1.18–1.22 and 1024 frames for Go 1.23–1.26; the shared output limit may shorten displayed stacks to 64 frames and sets `output_truncated`. An invalid bucket type, an excessive stack depth, or a cyclic bucket chain stops the scan with `partial`; repeated buckets are never counted twice.
+
+Once a scan becomes partial, it stops traversing further buckets and selects at most `MaxMemoryObjectEntries` entries by descending byte count from the valid samples retained from earlier batches and the current batch, within the aggregation budget. The `status_reason` records only the first cause; finishing the current batch does not append further causes.
+
+Any bucket header, record, or stack read failure, including a short read, fails the entire Go collection attempt and discards all runtime entries, including those from earlier batches. The collector reports `failed` with the read error; individual ranges are not retried.
+
+Samples with a stack depth of zero produce no allocation-site entry; an empty stack alone does not make the scan `partial`.
+
+Go snapshots require a known, enabled sampling rate and a nonempty bucket list. An unknown or disabled rate, or an empty bucket list, yields `unavailable` with a `status_reason` and no entries.
+
+Go collection uses a single request timeout across runtime reads, scanning,
+ranking, and entry construction. When it expires, runtime entries are discarded
+and the collector emits `failed` with a timeout reason; it still attempts to
+read the process memory summary. Cancellation is cooperative, so an in-flight
+system call or non-cancelable parsing step can finish after the deadline.
+
+Inspect `tracer_data.snapshot.status` (`complete`, `partial`,
+`unavailable`, or `failed`) together with `status_reason`, `runtime_version`,
+`duration_ms`, and `output_truncated`.
+
+`status_reason` explains why collection is `partial`, `unavailable`, or `failed`;
+it is omitted when empty. Both `snapshot` and `process_memory` use this field.
+Older records may use `reason`; readers of historical and new records should
+accept both names.
+
+`duration_ms` measures the provider stage, rounded up to milliseconds, for both
+successful and failed snapshots, including timeouts. It excludes runtime
+detection, process memory summary reads, output processing, and persistence.
+
+| Problem | Checks |
+|---------|--------|
+| No output | Enable and restart; check BlackList; see section 7.6 for v2 trigger conditions |
+| Event without a candidate | Check direct cgroup membership, OOM-kill eligibility, and enumeration limits |
+| `unavailable` / `failed` | Check runtime/layout restrictions, access permissions, container metadata, and target exit; inspect `status_reason` |
+| Event stops after resource exhaustion | Check `RLIMIT_NOFILE`, `fs.inotify.max_user_watches`, and `fs.inotify.max_user_instances`; adjust and restart; this stop does not stop other events |
