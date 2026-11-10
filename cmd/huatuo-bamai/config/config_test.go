@@ -660,3 +660,17 @@ func TestUpdatePublishesConsistentSnapshots(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestHostPackageWithoutNodeToken(t *testing.T) {
+	previous := hostCPURelease
+	t.Cleanup(func() { hostCPURelease = previous })
+	c := HTTPServerConfig{ListenAddress: "127.0.0.1:19704", MaxEventStreamClients: 1, EventStreamKeepAliveIntervalSeconds: 1}
+	hostCPURelease = "true"
+	if err := c.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	hostCPURelease = ""
+	if err := c.Validate(); err == nil {
+		t.Fatal("regular node accepted empty token")
+	}
+}

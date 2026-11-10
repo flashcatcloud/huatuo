@@ -24,8 +24,8 @@ epoch=$(git show -s --format=%ct HEAD)
 	echo "_output exists; use a fresh checkout" >&2
 	exit 1
 }
-make build BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
-make install-tools
+make build EXTRA_LDFLAGS="-X github.com/ccfos/huatuo/cmd/huatuo-bamai/config.hostCPURelease=true" BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
+bash build/install-tools.sh
 for command in cmd/*/; do
 	test -x "_output/bin/$(basename "$command")"
 done
@@ -34,6 +34,8 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 mkdir -p "$stage/$name" dist
 cp -R _output/bin _output/bpf _output/conf "$stage/$name/"
+# The host CPU package serves local n9e tasks and needs no node API credential.
+sed -i '/^[[:space:]]*BearerToken = "REPLACE_WITH_RANDOM_HEX"$/d' "$stage/$name/conf/huatuo-bamai.conf"
 cp LICENSE "$stage/$name/"
 cp _output/tools/bin/asprof "$stage/$name/bin/"
 cp -R _output/tools/lib "$stage/$name/"
@@ -45,7 +47,7 @@ import json, sys
 from pathlib import Path
 out, version, commit, arch, epoch = sys.argv[1:]
 Path(out).write_text(json.dumps(dict(version=version, commit=commit, architecture=arch,
-    source_epoch=int(epoch), storage='doris', sampler_source='build/install-tools.sh'), indent=2)+'\n')
+    source_epoch=int(epoch), storage='doris', task_policy='n9e-host-cpu-v1', sampler_source='build/install-tools.sh'), indent=2)+'\n')
 META
 python3 build/release/verify.py "$stage/$name" "$arch"
 COPYFILE_DISABLE=1 tar --format=gnu --no-xattrs --no-acls --no-selinux \

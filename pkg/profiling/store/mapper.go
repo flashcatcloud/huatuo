@@ -16,6 +16,9 @@ package store
 
 import (
 	"encoding/json"
+	"github.com/ccfos/huatuo/internal/timeutil"
+	"strings"
+	"time"
 
 	"github.com/ccfos/huatuo/internal/storage/driver"
 	"github.com/ccfos/huatuo/pkg/types"
@@ -30,19 +33,71 @@ const (
 	fieldProfileType = "profile_data.profile_type"
 )
 
-type mapper struct{}
+type mapper struct{ hostDoris bool }
+
+const hostTimeLayout = "2006-01-02 15:04:05.000 -0700"
+
+type hostFlameData struct {
+	FlameData *ProfileData `json:"flamedata"`
+}
+type hostDocument struct {
+	types.Document
+	Uploaded   timeutil.Timestamp `json:"uploaded_time"`
+	Time       string             `json:"time"`
+	TracerTime string             `json:"tracer_time"`
+	TracerData hostFlameData      `json:"tracer_data"`
+}
+
+func (m mapper) field(key string) string {
+	if !m.hostDoris {
+		return key
+	}
+	base := strings.TrimSuffix(key, ".keyword")
+	var name string
+	switch base {
+	case types.DocumentFieldUploadedTimestamp:
+		name = "uploaded_time"
+	case types.DocumentFieldStartedTimestamp:
+		name = "time"
+	case fieldProfileType:
+		name = "tracer_data.flamedata.profile_type"
+	default:
+		return key
+	}
+	return name + strings.TrimPrefix(key, base)
+}
 
 func (mapper) ID(*Document) string {
 	return xid.New().String()
 }
 
-func (mapper) Encode(document *Document) ([]byte, error) {
+func (m mapper) Encode(document *Document) ([]byte, error) {
+	if m.hostDoris {
+		if err := document.validate(); err != nil {
+			return nil, err
+		}
+		stamp := document.StartedTimestamp.Format(hostTimeLayout)
+		return json.Marshal(hostDocument{Document: document.Document, Uploaded: document.UploadedTimestamp, Time: stamp, TracerTime: stamp, TracerData: hostFlameData{document.ProfileData}})
+	}
 	return json.Marshal(document)
 }
 
-func (mapper) Decode(record driver.Record) (*Document, error) {
+func (m mapper) Decode(record driver.Record) (*Document, error) {
 	var document Document
-	if err := json.Unmarshal(record.Data, &document); err != nil {
+	if m.hostDoris {
+		var host hostDocument
+		if err := json.Unmarshal(record.Data, &host); err != nil {
+			return nil, err
+		}
+		started, err := time.Parse(hostTimeLayout, host.TracerTime)
+		if err != nil {
+			return nil, err
+		}
+		document.Document = host.Document
+		document.UploadedTimestamp = host.Uploaded
+		document.StartedTimestamp = &timeutil.Timestamp{Time: started}
+		document.ProfileData = host.TracerData.FlameData
+	} else if err := json.Unmarshal(record.Data, &document); err != nil {
 		return nil, err
 	}
 	if err := document.validate(); err != nil {
@@ -51,7 +106,7 @@ func (mapper) Decode(record driver.Record) (*Document, error) {
 	return &document, nil
 }
 
-func (mapper) Fields(document *Document) (map[string]any, error) {
+func (m mapper) Fields(document *Document) (map[string]any, error) {
 	if err := document.validate(); err != nil {
 		return nil, err
 	}
@@ -73,11 +128,20 @@ func (mapper) Fields(document *Document) (map[string]any, error) {
 	if document.ContainerHostname == "" {
 		delete(fields, types.DocumentFieldContainerHostname)
 	}
+	if m.hostDoris {
+		for _, key := range []string{types.DocumentFieldUploadedTimestamp, types.DocumentFieldStartedTimestamp, fieldProfileType} {
+			fields[m.field(key)] = fields[key]
+			delete(fields, key)
+		}
+		fields["uploaded_time"] = document.UploadedTimestamp.Time
+		fields["time"] = document.StartedTimestamp.Time
+		fields["tracer_time"] = document.StartedTimestamp.Time
+	}
 	return fields, nil
 }
 
-func (mapper) Indexes() []driver.Index {
-	return []driver.Index{
+func (m mapper) Indexes() []driver.Index {
+	indexes := []driver.Index{
 		{Field: types.DocumentFieldTracerID},
 		{Field: types.DocumentFieldHostname},
 		{Field: types.DocumentFieldRegion},
@@ -92,4 +156,11 @@ func (mapper) Indexes() []driver.Index {
 		{Field: types.DocumentFieldTracerType},
 		{Field: fieldProfileType},
 	}
+	if m.hostDoris {
+		for i := range indexes {
+			indexes[i].Field = m.field(indexes[i].Field)
+		}
+		indexes = append(indexes, driver.Index{Field: "tracer_time", Kind: driver.KindTime})
+	}
+	return indexes
 }

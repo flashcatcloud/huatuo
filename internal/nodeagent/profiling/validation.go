@@ -59,7 +59,11 @@ func validateRequest(request *StartRequest) error {
 	if err := request.Spec.Validate(); err != nil {
 		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
-	if !profilingdomain.SupportsScope(request.Spec.Language, request.Spec.Type, request.Scope) {
+	if request.HostPID != 0 {
+		if request.HostPID < 1 || request.Scope != observation.ScopeHost || request.Spec.Type != profilingdomain.TypeCPU || request.Spec.Mode != profilingdomain.ModeOnCPU {
+			return fmt.Errorf("%w: invalid host PID CPU request", ErrInvalidRequest)
+		}
+	} else if !profilingdomain.SupportsScope(request.Spec.Language, request.Spec.Type, request.Scope) {
 		return fmt.Errorf(
 			"%w: scope %q is not supported for type %q and language %q",
 			ErrInvalidRequest,

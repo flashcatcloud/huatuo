@@ -56,6 +56,7 @@ type ResultPublisher interface {
 
 // StartRequest contains one validated profiling operation request.
 type StartRequest struct {
+	HostPID     int
 	RequestID   string
 	Duration    time.Duration
 	Scope       observation.Scope

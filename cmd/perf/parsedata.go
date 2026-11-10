@@ -88,6 +88,7 @@ func buildFlameData(b bpf.BPF) ([]flamegraph.FrameData, error) {
 	}
 
 	u := symbol.NewUsymResolver()
+	defer u.Close()
 	for _, v := range items {
 		ed := eventdata{}
 		var count uint64

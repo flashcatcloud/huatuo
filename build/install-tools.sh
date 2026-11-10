@@ -22,21 +22,21 @@ TOOLS_DIR="$ROOT_DIR/_output/tools"
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-ASYNC_PROFILER_VERSION=4.1
-PY_SPY_VERSION=0.4.1
+ASYNC_PROFILER_VERSION=4.5
+PY_SPY_VERSION=0.4.2
 
 case "${TEST_TOOLS_ARCH:-$(uname -m)}" in
 x86_64 | amd64)
 	ASYNC_PROFILER_ARCH=x64
-	ASYNC_PROFILER_SHA256=3b13a38a0063f6970d985a379ddaed91bcf37e239a1ea461d09eacf629f3dde1
-	PY_SPY_PLATFORM=manylinux_2_5_x86_64.manylinux1_x86_64
-	PY_SPY_SHA256=6a80ec05eb8a6883863a367c6a4d4f2d57de68466f7956b6367d4edd5c61bb29
+	ASYNC_PROFILER_SHA256=89546fbb9ee0fc5496c7edd4099b0709489bc78b0d8057ccbb4b801f6b032b62
+	PY_SPY_URL=https://files.pythonhosted.org/packages/f9/34/dd7d3c763a00b7b965e25a5eab0acd1a345dbaf0f45fffe595278873a1c0/py_spy-0.4.2-py2.py3-none-manylinux_2_5_x86_64.manylinux1_x86_64.whl
+	PY_SPY_SHA256=aeb0323409199c785f730645e9f4bb7a7b9ca2c481f2c331a55642b5d13fa52f
 	;;
 aarch64 | arm64)
 	ASYNC_PROFILER_ARCH=arm64
-	ASYNC_PROFILER_SHA256=d0cb9c97c380672b625c06e5a3ed578e990f4674c6aae8b5249f584c4c9ac50e
-	PY_SPY_PLATFORM=manylinux_2_17_aarch64.manylinux2014_aarch64
-	PY_SPY_SHA256=ee776b9d512a011d1ad3907ed53ae32ce2f3d9ff3e1782236554e22103b5c084
+	ASYNC_PROFILER_SHA256=64c41d1465d60097439c50d7e924b4946f1f62b1cbd21ce5b034fad09c0d6979
+	PY_SPY_URL=https://files.pythonhosted.org/packages/89/23/3eb4c23c684ebd667674ce1d076ae855e0621d1d9bd5e052aa3f7982f757/py_spy-0.4.2-py2.py3-none-manylinux_2_17_aarch64.manylinux2014_aarch64.whl
+	PY_SPY_SHA256=142887e984a4e541071c99a4401ff8c3770f255d329dbd0f64e8c1dd51882cce
 	;;
 *)
 	echo "unsupported install-tools architecture: ${TEST_TOOLS_ARCH:-$(uname -m)}" >&2
@@ -45,7 +45,6 @@ aarch64 | arm64)
 esac
 
 ASYNC_PROFILER_URL="https://github.com/async-profiler/async-profiler/releases/download/v${ASYNC_PROFILER_VERSION}/async-profiler-${ASYNC_PROFILER_VERSION}-linux-${ASYNC_PROFILER_ARCH}.tar.gz"
-PY_SPY_URL="https://github.com/benfred/py-spy/releases/download/v${PY_SPY_VERSION}/py_spy-${PY_SPY_VERSION}-py2.py3-none-${PY_SPY_PLATFORM}.whl"
 
 ASYNC_PROFILER_ARCHIVE="$WORK_DIR/async-profiler.tar.gz"
 PY_SPY_WHEEL="$WORK_DIR/py-spy.whl"

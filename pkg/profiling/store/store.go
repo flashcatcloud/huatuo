@@ -57,7 +57,8 @@ type Filter struct {
 
 // Store persists and queries profiling aggregation windows.
 type Store struct {
-	store *storage.Store[*Document]
+	store  *storage.Store[*Document]
+	mapper mapper
 }
 
 // NewFromConfig creates profiling storage backed by Elasticsearch.
@@ -73,14 +74,26 @@ func NewFromConfig(ctx context.Context, config Config) (*Store, error) {
 
 // NewWithBackendConfig creates profiling storage on the selected backend.
 func NewWithBackendConfig(ctx context.Context, config *driver.Config) (*Store, error) {
-	profileStore, err := storage.NewFromConfig[*Document](ctx, config, Collection, mapper{})
+	return newWithMapper(ctx, config, mapper{})
+}
+
+// NewHostDoris uses the existing n9e-plus profiling_metadata schema.
+func NewHostDoris(ctx context.Context, config *driver.Config) (*Store, error) {
+	cfg := *config
+	m := mapper{hostDoris: true}
+	cfg.DorisPartitionField = m.field(cfg.DorisPartitionField)
+	return newWithMapper(ctx, &cfg, m)
+}
+
+func newWithMapper(ctx context.Context, config *driver.Config, m mapper) (*Store, error) {
+	profileStore, err := storage.NewFromConfig[*Document](ctx, config, Collection, m)
 	if err != nil {
 		return nil, err
 	}
 	log.WithField("driver", config.Driver).WithField("index", config.ESIndex).Info(
 		"initialized profile storage",
 	)
-	return &Store{store: profileStore}, nil
+	return &Store{store: profileStore, mapper: m}, nil
 }
 
 // Save queues a profiling window for asynchronous persistence.
@@ -123,7 +136,7 @@ func (s *Store) Search(ctx context.Context, filter *Filter, consume func([]*Docu
 	if s == nil || s.store == nil {
 		return errors.New("profile storage is not initialized")
 	}
-	return s.store.Query(ctx, buildSearchQuery(filter), consume)
+	return s.store.Query(ctx, s.mapQuery(buildSearchQuery(filter)), consume)
 }
 
 // ListByTracerID returns one page of profiling windows for a task.
@@ -163,8 +176,8 @@ func (s *Store) Values(
 	}
 	return s.store.Values(
 		ctx,
-		normalizedField,
-		buildAggregationQuery(filter),
+		s.mapper.field(normalizedField),
+		s.mapQuery(buildAggregationQuery(filter)),
 		normalizeValuesSize(filter),
 	)
 }
@@ -271,4 +284,14 @@ func (s *Store) prepareDocument(document *Document) error {
 		document.UploadedTimestamp = timeutil.Now()
 	}
 	return nil
+}
+
+func (s *Store) mapQuery(q driver.Query) driver.Query {
+	for i := range q.Sorts {
+		q.Sorts[i].Field = s.mapper.field(q.Sorts[i].Field)
+	}
+	for i := range q.Filters {
+		q.Filters[i].Field = s.mapper.field(q.Filters[i].Field)
+	}
+	return q
 }

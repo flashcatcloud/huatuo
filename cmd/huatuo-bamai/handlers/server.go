@@ -19,6 +19,7 @@ import (
 	"time"
 
 	nodeapi "github.com/ccfos/huatuo/apis/v1/node"
+	"github.com/ccfos/huatuo/cmd/huatuo-bamai/config"
 	nodecloudevents "github.com/ccfos/huatuo/internal/nodeagent/cloudevents"
 	"github.com/ccfos/huatuo/internal/nodeagent/operation"
 	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
@@ -68,7 +69,7 @@ func Start(opts *ServerOptions) (*server.Server, error) {
 }
 
 func newHTTPServer(opts *ServerOptions, nodeHandler *NodeAPIHandler) (*server.Server, error) {
-	s := server.NewServer(&server.Config{
+	cfg := &server.Config{
 		EnablePProf: true,
 		RateLimit: &server.RateLimitConfig{
 			RequestsPerSecond: 200,
@@ -87,8 +88,17 @@ func newHTTPServer(opts *ServerOptions, nodeHandler *NodeAPIHandler) (*server.Se
 			nodeapi.HTTPStatusForErrorCode,
 			response.LegacyHTTPStatusForErrorCode,
 		),
-	})
-
+	}
+	if config.HostCPURelease() {
+		// The packaged endpoint serves only n9e host CPU operations.
+		cfg.EnablePProf = false
+		cfg.AuthTokens = nil
+		s := server.NewServer(cfg)
+		s.MustRegisterRoutes("/tasks", hostTaskRoutes(opts))
+		s.MustRegisterRoutes("", []server.Route{{Method: "GET", Path: "/healthz", Handler: func(ctx *server.Context) error { ctx.Status(200); return nil }}})
+		return s, nil
+	}
+	s := server.NewServer(cfg)
 	errorHandlers := s.StrictErrorHandlers()
 	strictHandler := nodeapi.NewStrictHandlerWithOptions(
 		nodeHandler,

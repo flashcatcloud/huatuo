@@ -59,11 +59,15 @@ func startOperations(d *Daemon) (func(context.Context) error, error) {
 		}
 	}()
 
+	toolDir := cfg.Profiling.ToolDir
+	if config.HostCPURelease() {
+		toolDir = filepath.Dir(d.opts.ToolBinDir)
+	}
 	profilingService, err := nodeprofiling.NewService(manager, &nodeprofiling.Config{
 		ProfilerPath:         filepath.Join(d.opts.ToolBinDir, "profiler"),
 		ToolstreamSocketPath: toolstream.DefaultSockPath,
 		NodeAPIAddress:       nodeAPIAddress,
-		ToolDir:              cfg.Profiling.ToolDir,
+		ToolDir:              toolDir,
 		AggregationInterval: time.Duration(cfg.Profiling.AggregationIntervalSeconds) *
 			time.Second,
 		MaxConcurrentProcesses:  cfg.Profiling.MaxConcurrentProcesses,

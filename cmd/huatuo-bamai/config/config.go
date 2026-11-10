@@ -204,6 +204,11 @@ func (c RuntimeConfig) Validate() error {
 	return nil
 }
 
+// Set by the release linker for the n9e host CPU package.
+var hostCPURelease string
+
+func HostCPURelease() bool { return hostCPURelease == "true" }
+
 // Validate rejects invalid HTTP server settings.
 func (c HTTPServerConfig) Validate() error {
 	if _, _, err := net.SplitHostPort(c.ListenAddress); err != nil {
@@ -215,7 +220,7 @@ func (c HTTPServerConfig) Validate() error {
 	if c.EventStreamKeepAliveIntervalSeconds <= 0 {
 		return errors.New("event stream keepalive interval must be greater than zero seconds")
 	}
-	if strings.TrimSpace(c.Auth.BearerToken) == "" {
+	if !HostCPURelease() && strings.TrimSpace(c.Auth.BearerToken) == "" {
 		return errors.New("auth bearer token is required")
 	}
 	if strings.ContainsAny(c.Auth.BearerToken, " \t\r\n") {

@@ -42,6 +42,12 @@ func buildCommand(request *StartRequest, config *Config) (executil.Spec, error) 
 		"--huatuo-api-address", config.NodeAPIAddress,
 		"--tool-path", config.ToolDir,
 	}
+	if request.HostPID > 0 {
+		args = append(args, "--pid", strconv.Itoa(request.HostPID))
+		if request.Spec.Language == profilingdomain.LanguageGo || request.Spec.Language == profilingdomain.LanguageCPP {
+			args = append(args, "--thread-group")
+		}
+	}
 	if request.Scope == observation.ScopeContainer {
 		args = append(args, "--container-id", request.ContainerID)
 	}

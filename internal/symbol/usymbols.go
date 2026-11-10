@@ -18,6 +18,7 @@ import (
 	"context"
 	"debug/elf"
 	"debug/gosym"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
@@ -37,6 +38,8 @@ type executableCache struct {
 }
 
 type elfSymbolCache struct {
+	large         *compactELF
+	triedLarge    bool
 	state         *elfSymbolParseState
 	namesByELFPC  map[uint64]string
 	goTable       *gosym.Table
@@ -266,9 +269,26 @@ func (r *UsymResolver) resolveELFPCs(path string, cache *elfSymbolCache, pcs []u
 	if cache.state == nil {
 		cache.state = newELFSymbolParseState(r.elfSymbolLimits)
 	}
-	syms, err := elfSymbolsForPCsWithState(f, unresolved, cache.state)
-	if err != nil {
-		log.Debugf("symbol: parse ELF PCs for %q: %v", path, err)
+	var syms symbols
+	if cache.large == nil {
+		syms, err = elfSymbolsForPCsWithState(f, unresolved, cache.state)
+		if errors.Is(err, errELFSymbolLimit) && !cache.triedLarge && r.elfSymbolLimits == DefaultELFSymbolLimits() {
+			cache.triedLarge = true
+			owned, openErr := elf.Open(path)
+			if openErr == nil {
+				cache.large = newELFIndex(owned)
+				if cache.large == nil {
+					owned.Close()
+				}
+			}
+		}
+	}
+	if cache.large != nil {
+		for _, pc := range unresolved {
+			if name := cache.large.resolve(pc); name != "" {
+				result[pc] = name
+			}
+		}
 	}
 	if cache.namesByELFPC == nil {
 		cache.namesByELFPC = make(map[uint64]string)
@@ -489,4 +509,20 @@ func (r *UsymResolver) mountKeyForPID(pid uint32, hostPath string) (string, erro
 		return "", err
 	}
 	return matchXfsMount(lowerDir, mounts)
+}
+
+// Close releases descriptors used to read sampled names in large binaries.
+func (r *UsymResolver) Close() {
+	for _, c := range r.exeCache {
+		if c.symbols.large != nil {
+			c.symbols.large.file.Close()
+			c.symbols.large = nil
+		}
+	}
+	for _, c := range r.libCaches {
+		if c.large != nil {
+			c.large.file.Close()
+			c.large = nil
+		}
+	}
 }

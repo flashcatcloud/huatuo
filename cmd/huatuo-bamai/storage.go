@@ -120,7 +120,11 @@ func initStorage(
 	tracingStore = initializedTracingStore
 
 	if storeConfig := profileStorageConfig(cfg); storeConfig != nil {
-		initializedProfileStore, err := profilingstore.NewWithBackendConfig(context.Background(), storeConfig)
+		openProfile := profilingstore.NewWithBackendConfig
+		if config.HostCPURelease() && storeConfig.Driver == "doris" {
+			openProfile = profilingstore.NewHostDoris
+		}
+		initializedProfileStore, err := openProfile(context.Background(), storeConfig)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("new profiling document store (%s): %w", storeConfig.Driver, err)
 		}
