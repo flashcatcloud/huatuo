@@ -619,7 +619,7 @@ func TestValidatePythonProfileOptions(t *testing.T) {
 }
 
 func TestRemotePythonPIDUsesOneWindow(t *testing.T) {
-	ctx := newValidationCLIContext(t, "-l", "python", "-t", "cpu", "--pid", strconv.Itoa(os.Getpid()),
+	ctx := newValidationCLIContext(t, "--language", "python", "--type", "cpu", "--pid", strconv.Itoa(os.Getpid()),
 		"--duration", "20", "--aggr-interval", "10", "--output-format", "remote", "--tracer-id", "host-window",
 		"--output-storage", "/var/run/huatuo-toolstream.sock", "--log-file", "stdout")
 	require.NoError(t, runBefore(ctx))
