@@ -1,0 +1,90 @@
+name: Flashcat Huatuo artifacts
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: New release tag for this revision
+        required: true
+        type: string
+permissions:
+  contents: read
+concurrency:
+  group: huatuo-release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: bash -n build/install-tools.sh
+      - run: |
+          bash -n build/release/package.sh
+          python3 -m py_compile build/release/verify.py
+  build:
+    needs: check
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+      - name: Verify release tag
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang llvm libbpf-dev libelf-dev binutils capnproto
+          go install github.com/vektra/mockery/v2@v2.53.6
+          go install capnproto.org/go/capnp/v3/capnpc-go@v3.1.0-alpha.2
+      - name: Build and verify archive
+        env:
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          RELEASE_ARCH: ${{ matrix.arch }}
+        run: bash build/release/package.sh "$RELEASE_TAG" "$RELEASE_ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: huatuo-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: huatuo-*
+          merge-multiple: true
+          path: dist
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          cd dist
+          sha256sum -c -- *.sha256
+          args=(--target "$GITHUB_SHA" --generate-notes)
+          if [[ "$RELEASE_TAG" == *-*rc.* ]]; then args+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "${args[@]}" -- *.tar.gz *.sha256

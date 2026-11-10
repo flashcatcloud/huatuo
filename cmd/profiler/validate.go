@@ -17,6 +17,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -128,16 +129,19 @@ func validateLanguageOptions(ctx *cli.Context, lang profiling.Language, typ prof
 
 		return nil
 
-	case profiling.LanguageJava:
-		if ctx.String("tool-path") == "" {
-			return fmt.Errorf("language=%s requires --tool-path", lang)
+	case profiling.LanguageJava, profiling.LanguagePython:
+		// n9e-plus sends only the target PID; samplers ship beside bin/profiler.
+		if !ctx.IsSet("tool-path") {
+			exe, err := os.Executable()
+			if err != nil {
+				return fmt.Errorf("locate packaged profiler: %w", err)
+			}
+			if err := ctx.Set("tool-path", filepath.Dir(filepath.Dir(exe))); err != nil {
+				return err
+			}
 		}
-
-		return validateExactlyOneTarget(ctx)
-
-	case profiling.LanguagePython:
-		if err := ensurePythonToolPath(ctx); err != nil {
-			return err
+		if ctx.String("tool-path") == "" {
+			return fmt.Errorf("language=%s requires a nonempty --tool-path", lang)
 		}
 		return validateExactlyOneTarget(ctx)
 
@@ -164,13 +168,6 @@ func validatePythonProfileOptions(lang profiling.Language, typ profiling.Type, d
 		)
 	}
 	return nil
-}
-
-func ensurePythonToolPath(ctx *cli.Context) error {
-	if ctx.String("tool-path") != "" {
-		return nil
-	}
-	return fmt.Errorf("language=python requires --tool-path")
 }
 
 func validateExactlyOneTarget(ctx *cli.Context) error {
