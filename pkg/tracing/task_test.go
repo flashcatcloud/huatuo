@@ -15,6 +15,7 @@
 package tracing
 
 import (
+	"context"
 	"errors"
 	"os"
 	"path/filepath"
@@ -333,5 +334,41 @@ func TestSetDeadlineDefault(t *testing.T) {
 	setDeadlineDefault(task)
 	if !task.deadlineTime.After(before) {
 		t.Errorf("deadlineTime=%v should be after %v", task.deadlineTime, before)
+	}
+}
+
+func TestDrainTasksWaitsForProfilerCleanup(t *testing.T) {
+	clearTaskCache()
+	dir := t.TempDir()
+	prev := TaskBinDir
+	TaskBinDir = dir
+	t.Cleanup(func() { TaskBinDir = prev; clearTaskCache() })
+	createExecutableScript(t, dir, "profiler", `#!/bin/sh
+trap 'touch "$1/clean"; exit 0' INT
+touch "$1/ready"
+while :; do sleep 0.05; done
+`)
+	id, err := NewTaskWithID("drain", "profiler", 5*time.Second, TaskStorageStdout, []string{dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer StopTask(id)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "ready")); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("profiler did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := DrainTasks(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "clean")); err != nil {
+		t.Fatalf("cleanup missing after drain: %v", err)
 	}
 }
