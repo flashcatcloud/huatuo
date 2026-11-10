@@ -108,6 +108,9 @@ func newSingleRingBufferContext(
 
 // Close releases the ring buffer readers. Should be called when profiling ends.
 func (r *ringBufferContext) Close() {
+	if r.usym != nil {
+		r.usym.Close()
+	}
 	if r.readerA != nil {
 		r.readerA.Close()
 	}

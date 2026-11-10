@@ -27,12 +27,12 @@ import (
 
 type elfCache struct {
 	secs   sections
-	syms   symbols
+	syms   symbolLookup
 	goSyms *goSymTable
 }
 
 type libCache struct {
-	syms   symbols
+	syms   symbolLookup
 	goSyms *goSymTable
 }
 
@@ -62,6 +62,22 @@ func NewUsymResolver() *UsymResolver {
 		procmaps:  make(map[uint32]sections),
 		names:     make(map[string]string),
 	}
+}
+
+// Close releases files kept for on-demand name resolution.
+func (r *UsymResolver) Close() {
+	for _, c := range r.exeCache {
+		if idx, ok := c.syms.(*compactELF); ok {
+			idx.file.Close()
+		}
+	}
+	for _, c := range r.libcaches {
+		if idx, ok := c.syms.(*compactELF); ok {
+			idx.file.Close()
+		}
+	}
+	clear(r.exeCache)
+	clear(r.libcaches)
 }
 
 // UsymStackBytes resolves user-space stack addresses into byte frames (innermost first).
@@ -187,7 +203,7 @@ func (r *UsymResolver) loadElfCaches(pid uint32) (*elfCache, error) {
 	if err != nil {
 		return nil, fmt.Errorf("elf.Open %q: %w", path, err)
 	}
-	defer f.Close()
+	// newELFIndex takes ownership of the ELF file.
 
 	secs := make(sections, 0, len(f.Sections))
 	for _, s := range f.Sections {
@@ -199,10 +215,11 @@ func (r *UsymResolver) loadElfCaches(pid uint32) (*elfCache, error) {
 	}
 	secs.sort()
 
+	goTable := loadGoSymTable(f, path)
 	cache = &elfCache{
 		secs:   secs,
-		syms:   elfSymbols(f),
-		goSyms: loadGoSymTable(f, path),
+		syms:   newELFIndex(f),
+		goSyms: goTable,
 	}
 	r.exeCache[key] = cache
 	r.exeKeys[pid] = key
@@ -245,11 +262,12 @@ func (r *UsymResolver) loadLibCache(pid uint32, libPath string) (*libCache, erro
 	if err != nil {
 		return nil, fmt.Errorf("elf.Open %q: %w", libPath, err)
 	}
-	defer f.Close()
+	// newELFIndex takes ownership of the ELF file.
 
+	goTable := loadGoSymTable(f, libPath)
 	cache = &libCache{
-		syms:   elfSymbols(f),
-		goSyms: loadGoSymTable(f, libPath),
+		syms:   newELFIndex(f),
+		goSyms: goTable,
 	}
 	r.libcaches[key] = cache
 	r.libKeys[libPath] = key
