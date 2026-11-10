@@ -16,6 +16,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"huatuo-bamai/cmd/huatuo-bamai/config"
@@ -84,5 +85,8 @@ func startHandlers(d *Daemon) (func(context.Context) error, error) {
 	}
 	d.apiServer = runningServer
 
-	return runningServer.Shutdown, nil
+	return func(ctx context.Context) error {
+		serverErr := runningServer.Shutdown(ctx)
+		return errors.Join(serverErr, tracing.DrainTasks(ctx))
+	}, nil
 }

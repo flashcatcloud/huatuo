@@ -63,6 +63,15 @@ func runBefore(ctx *cli.Context) error {
 	if !profiling.IsSupported(lang, typ) {
 		return fmt.Errorf("language %s does not support profiling type %s", lang, typ)
 	}
+	// py-spy records a host PID once for the full requested duration.
+	if lang == profiling.LanguagePython && typ == profiling.TypeCPU && ctx.String("pid") != "" && ctx.String("output-format") == "remote" {
+		duration, interval := ctx.Int("duration"), ctx.Int("aggr-interval")
+		if interval > 0 && interval < duration {
+			if err := ctx.Set("aggr-interval", strconv.Itoa(duration)); err != nil {
+				return err
+			}
+		}
+	}
 	if err := validatePythonProfileOptions(lang, typ, ctx.Int("duration"), ctx.Int("aggr-interval")); err != nil {
 		return err
 	}

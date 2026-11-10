@@ -20,6 +20,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
 	"os/exec"
 	"path"
 	"sort"
@@ -230,6 +231,10 @@ func runTask(ctx context.Context, task *task) {
 	task.mu.Unlock()
 
 	cmd := exec.CommandContext(ctx, path.Join(TaskBinDir, task.execBinary), task.execArgs...)
+	if task.execBinary == "profiler" {
+		cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
+		cmd.WaitDelay = 4 * time.Second
+	}
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		contextErr := ctx.Err()
@@ -368,6 +373,29 @@ func Result(taskID string) *TaskResult {
 		TaskStatus: task.status,
 		TaskErr:    task.error,
 	}
+}
+
+// DrainTasks cancels registered tasks together so independent profiler cleanup
+// runs concurrently while the node's toolstream and storage are still available.
+// The node calls this after shutting down the HTTP task producer.
+func DrainTasks(ctx context.Context) error {
+	taskCreateMu.Lock()
+	var pending []<-chan struct{}
+	taskLifeTmpCache.Range(func(_, value any) bool {
+		t := value.(*task)
+		t.cancelFunc()
+		pending = append(pending, t.doneCh)
+		return true
+	})
+	taskCreateMu.Unlock()
+	for _, done := range pending {
+		select {
+		case <-done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return nil
 }
 
 // StopTask stops a running task given its ID.
