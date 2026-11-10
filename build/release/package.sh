@@ -24,7 +24,7 @@ epoch=$(git show -s --format=%ct HEAD)
 	echo "_output exists; use a fresh checkout" >&2
 	exit 1
 }
-make build BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
+make build EXTRA_LDFLAGS="-X huatuo-bamai/cmd/huatuo-bamai/handlers.hostCPURelease=true" BUILD_MODE=static APP_VERSION="$version" APP_COMMIT="$commit" APP_BUILD_TIME="$epoch"
 make sync
 bash build/install-tools.sh
 for command in cmd/*/; do
@@ -46,7 +46,7 @@ import json, sys
 from pathlib import Path
 out, version, commit, arch, epoch = sys.argv[1:]
 Path(out).write_text(json.dumps(dict(version=version, commit=commit, architecture=arch,
-    source_epoch=int(epoch), storage='doris', sampler_source='build/install-tools.sh'), indent=2)+'\n')
+    source_epoch=int(epoch), storage='doris', task_policy='n9e-host-cpu-v1', sampler_source='build/install-tools.sh'), indent=2)+'\n')
 META
 python3 build/release/verify.py "$stage/$name" "$arch"
 COPYFILE_DISABLE=1 tar --format=gnu --no-xattrs --no-acls --no-selinux \

@@ -15,6 +15,8 @@
 package handlers
 
 import (
+	"net/http"
+
 	"huatuo-bamai/cmd/huatuo-bamai/config"
 	"huatuo-bamai/internal/server"
 	"huatuo-bamai/internal/version"
@@ -34,7 +36,7 @@ type ServerOptions struct {
 // Start starts the HTTP server with all handlers registered.
 func Start(opts ServerOptions) (*server.Server, error) {
 	s := server.NewServer(&server.Config{
-		EnablePProf: true,
+		EnablePProf: hostCPURelease != "true",
 		RateLimit: &server.RateLimitConfig{
 			RequestsPerSecond: 200,
 			Burst:             200,
@@ -47,9 +49,15 @@ func Start(opts ServerOptions) (*server.Server, error) {
 	SetTracingManager(opts.TracingManager)
 
 	s.MustRegisterRoutes("/tasks", NewTaskHandler().Handlers)
-	s.MustRegisterRoutes("/tracers", NewTracerHandler(opts.TracingManager).Handlers)
+	for _, route := range NewTracerHandler(opts.TracingManager).Handlers {
+		if hostCPURelease != "true" || route.Method == http.MethodGet {
+			s.MustRegisterRoutes("/tracers", []server.Route{route})
+		}
+	}
 	s.MustRegisterRoutes("", NewContainerHandler().Handlers)
-	s.MustRegisterRoutes("", NewConfigHandler().Handlers)
+	if hostCPURelease != "true" {
+		s.MustRegisterRoutes("", NewConfigHandler().Handlers)
+	}
 	httpConfig := config.Get().HTTPServer
 	s.MustRegisterRoutes(
 		"/v1/events",

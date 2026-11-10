@@ -29,7 +29,7 @@ APP_CMD_BIN_TARGETS := $(patsubst %,$(APP_CMD_OUTPUT)/bin/%,$(notdir $(APP_CMD_S
 
 GO_BUILD_FLAGS := CGO_ENABLED=1 go build -tags "netgo osusergo" -gcflags=all="-N -l"
 GO_BUILD_LDFLAGS := \
-	-s -w \
+	-s -w $(EXTRA_LDFLAGS) \
 	-X main.AppVersion=$(APP_VERSION) \
 	-X main.AppGitCommit=$(APP_COMMIT) \
 	-X main.AppBuildTime=$(APP_BUILD_TIME)

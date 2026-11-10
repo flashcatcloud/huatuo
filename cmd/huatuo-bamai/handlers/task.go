@@ -17,6 +17,11 @@ package handlers
 import (
 	"errors"
 	"net/http"
+	"os"
+	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"time"
 
 	v1 "huatuo-bamai/apis/v1"
@@ -51,6 +56,53 @@ type NewTaskReq struct {
 	TracerArgs []string `json:"trace_args" binding:"omitempty"`
 }
 
+// Set at link time only for the Flashcat host profiling release.
+var hostCPURelease string
+
+var hostJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
+
+func validateHostCPU(req NewTaskReq, executable string) error {
+	a := req.TracerArgs
+	invalid := errors.New("expected a host CPU profiler request with package-owned tools and output")
+	if req.TracerName != "profiler" || req.DataType != "db-json" || !hostJobID.MatchString(req.RequestID) ||
+		req.Timeout < 40 || req.Timeout >= 3600 || len(a) < 6 || a[0] != "-t" || a[1] != "cpu" || a[2] != "-l" || a[4] != "--pid" {
+		return invalid
+	}
+	pid, err := strconv.ParseInt(a[5], 10, 32)
+	if err != nil || pid <= 0 {
+		return invalid
+	}
+	lang := a[3]
+	a = a[6:]
+	switch lang {
+	case "java", "python":
+		if len(a) < 2 || a[0] != "--tool-path" || a[1] != filepath.Dir(filepath.Dir(executable)) {
+			return invalid
+		}
+		a = a[2:]
+	case "go", "c++":
+		if len(a) < 1 || a[0] != "--thread-group" {
+			return invalid
+		}
+		a = a[1:]
+	default:
+		return invalid
+	}
+	duration := req.Timeout - 20
+	interval := 10
+	if lang == "python" {
+		interval = duration
+	}
+	if !slices.Equal(a, []string{
+		"--tracer-id", req.RequestID, "--duration", strconv.Itoa(duration),
+		"--aggr-interval", strconv.Itoa(interval), "--max-concurrent-procs", "10",
+		"--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock",
+	}) {
+		return invalid
+	}
+	return nil
+}
+
 func handleBindError(ctx *server.Context, err error) {
 	var validationError *validator.ValidationErrors
 	if errors.As(err, &validationError) {
@@ -72,6 +124,15 @@ func (h *TaskHandler) create(ctx *server.Context) error {
 		return nil
 	}
 
+	if hostCPURelease == "true" {
+		exe, err := os.Executable()
+		if err != nil {
+			return response.ErrInternal.WithMessage("cannot locate packaged profiler tools")
+		}
+		if err := validateHostCPU(req, exe); err != nil {
+			return response.ErrInvalidRequest.WithMessage(err.Error())
+		}
+	}
 	storageDefault := tracing.TaskStorageDB
 	if req.DataType == "json" {
 		storageDefault = tracing.TaskStorageStdout
