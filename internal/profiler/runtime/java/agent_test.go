@@ -174,6 +174,7 @@ func TestStartAsprofCallbackBuildsStartCommand(t *testing.T) {
 		},
 		"cpu",
 		"session123",
+		20*time.Second,
 		10*time.Second,
 		4,
 	)(999999999)
@@ -181,6 +182,7 @@ func TestStartAsprofCallbackBuildsStartCommand(t *testing.T) {
 		"start",
 		"--libpath", "/tmp/libasyncProfiler.so",
 		"-e", "cpu",
+		"--timeout", "20s",
 		"--loop", "10s",
 		"-o", "collapsed",
 		"-f", "/tmp/huatuo-asprof-session123-cpu-999999999-%n{4}.collapsed",

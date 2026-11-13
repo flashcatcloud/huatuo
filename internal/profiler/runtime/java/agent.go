@@ -130,6 +130,7 @@ func StartAsprofSampling(ctx context.Context, opt *AsprofSamplingOption) (map[in
 		opt.BaseArgs,
 		opt.OutFilePrefix,
 		opt.SessionID,
+		opt.Duration,
 		opt.AggrInterval,
 		opt.outputFileCount,
 	)
@@ -178,16 +179,17 @@ func startAsprofCallback(
 	baseArgs []string,
 	outFilePrefix string,
 	sessionID string,
-	aggrInterval time.Duration,
+	duration, aggrInterval time.Duration,
 	outputFileCount uint64,
 ) func(int) []string {
 	return func(pid int) []string {
-		args := make([]string, len(baseArgs)+1, len(baseArgs)+8)
+		args := make([]string, len(baseArgs)+1, len(baseArgs)+10)
 		args[0] = "start"
 		copy(args[1:], baseArgs)
 		outFile := loopOutputPath(sessionID, outFilePrefix, pid, outputFileCount)
 		args = append(
 			args,
+			"--timeout", formatAsprofDuration(duration),
 			"--loop", formatAsprofDuration(aggrInterval),
 			"-o", "collapsed",
 			"-f", outFile,
