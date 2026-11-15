@@ -116,5 +116,14 @@ func (e *executor) withOutput(action string, err error) error {
 	if len(output) == 0 {
 		return fmt.Errorf("%s: %w", action, err)
 	}
-	return fmt.Errorf("%s: %w; output: %s", action, err, output)
+	return &samplerError{cause: fmt.Errorf("%s: %w", action, err), output: string(output)}
 }
+
+type samplerError struct {
+	cause  error
+	output string
+}
+
+func (e *samplerError) Error() string         { return e.cause.Error() + "; output: " + e.output }
+func (e *samplerError) Unwrap() error         { return e.cause }
+func (e *samplerError) SamplerOutput() string { return e.output }

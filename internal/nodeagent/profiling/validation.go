@@ -60,8 +60,8 @@ func validateRequest(request *StartRequest) error {
 		return fmt.Errorf("%w: %w", ErrInvalidRequest, err)
 	}
 	if request.HostPID != 0 {
-		if request.HostPID < 1 || request.Scope != observation.ScopeHost || request.Spec.Type != profilingdomain.TypeCPU || request.Spec.Mode != profilingdomain.ModeOnCPU {
-			return fmt.Errorf("%w: invalid host PID CPU request", ErrInvalidRequest)
+		if request.HostPID < 1 || request.Scope != observation.ScopeHost {
+			return fmt.Errorf("%w: invalid host PID profiling request", ErrInvalidRequest)
 		}
 	} else if !profilingdomain.SupportsScope(request.Spec.Language, request.Spec.Type, request.Scope) {
 		return fmt.Errorf(

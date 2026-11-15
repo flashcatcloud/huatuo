@@ -16,12 +16,6 @@ package handlers
 
 import (
 	"errors"
-	"github.com/ccfos/huatuo/internal/nodeagent/operation"
-	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
-	"github.com/ccfos/huatuo/internal/server"
-	"github.com/ccfos/huatuo/internal/server/response"
-	"github.com/ccfos/huatuo/pkg/observation"
-	"github.com/ccfos/huatuo/pkg/profiling"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +24,13 @@ import (
 	"slices"
 	"strconv"
 	"time"
+
+	"github.com/ccfos/huatuo/internal/nodeagent/operation"
+	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
+	"github.com/ccfos/huatuo/internal/server"
+	"github.com/ccfos/huatuo/internal/server/response"
+	"github.com/ccfos/huatuo/pkg/observation"
+	"github.com/ccfos/huatuo/pkg/profiling"
 )
 
 type NewTaskReq struct {
@@ -42,34 +43,64 @@ type NewTaskReq struct {
 
 var hostJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
-func validateHostCPU(req NewTaskReq, executable string) error {
+func parseHostTask(req *NewTaskReq, executable string) (*nodeprofiling.StartRequest, error) {
 	a := req.TracerArgs
-	invalid := errors.New("expected a host CPU profiler request with package-owned tools and output")
+	invalid := errors.New("invalid host profiling arguments: expected a supported mode with package-owned tools and output")
 	if req.TracerName != "profiler" || req.DataType != "db-json" || !hostJobID.MatchString(req.RequestID) ||
-		req.Timeout < 40 || req.Timeout >= 3600 || len(a) < 6 || a[0] != "-t" || a[1] != "cpu" || a[2] != "-l" || a[4] != "--pid" {
-		return invalid
+		req.Timeout < 40 || req.Timeout >= 3600 || len(a) < 6 || a[0] != "-t" {
+		return nil, invalid
 	}
-	pid, err := strconv.ParseInt(a[5], 10, 32)
+	spec := profiling.Spec{Type: profiling.Type(a[1]), Mode: profiling.ModeOnCPU}
+	var phase profiling.OffCPUPhase
+	a = a[2:]
+	switch spec.Type {
+	case profiling.TypeCPU:
+		if len(a) >= 4 && a[0] == "--cpu-mode" && a[1] == "offcpu" && a[2] == "--offcpu-phase" {
+			var err error
+			phase, err = profiling.ParseOffCPUPhase(a[3])
+			if err != nil {
+				return nil, err
+			}
+			spec.Mode = profiling.ModeOffCPU
+			a = a[4:]
+		}
+	case profiling.TypeMemory:
+		if len(a) < 2 || a[0] != "--memory-mode" {
+			return nil, invalid
+		}
+		spec.Mode = profiling.Mode(a[1])
+		a = a[2:]
+	default:
+		return nil, invalid
+	}
+	if len(a) < 4 || a[0] != "-l" || a[2] != "--pid" {
+		return nil, invalid
+	}
+	spec.Language = profiling.Language(a[1])
+	if err := spec.Validate(); err != nil {
+		return nil, err
+	}
+	pid, err := strconv.ParseInt(a[3], 10, 32)
 	if err != nil || pid <= 0 {
-		return invalid
+		return nil, invalid
 	}
-	lang := a[3]
-	a = a[6:]
+	lang := a[1]
+	a = a[4:]
 	switch lang {
 	case "java", "python":
 		if len(a) > 0 && a[0] == "--tool-path" {
 			if len(a) < 2 || a[1] != filepath.Dir(filepath.Dir(executable)) {
-				return invalid
+				return nil, invalid
 			}
 			a = a[2:]
 		}
-	case "go", "c++":
+	case "c", "go", "c++":
 		if len(a) < 1 || a[0] != "--thread-group" {
-			return invalid
+			return nil, invalid
 		}
 		a = a[1:]
 	default:
-		return invalid
+		return nil, invalid
 	}
 	duration := req.Timeout - 20
 	interval := 10
@@ -81,9 +112,9 @@ func validateHostCPU(req NewTaskReq, executable string) error {
 		"--aggr-interval", strconv.Itoa(interval), "--max-concurrent-procs", "10",
 		"--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock",
 	}) {
-		return invalid
+		return nil, invalid
 	}
-	return nil
+	return &nodeprofiling.StartRequest{RequestID: req.RequestID, HostPID: int(pid), Duration: time.Duration(duration) * time.Second, Scope: observation.ScopeHost, Spec: spec, OffCPUPhase: phase}, nil
 }
 
 func hostTaskRoutes(opts *ServerOptions) []server.Route {
@@ -97,11 +128,11 @@ func hostTaskRoutes(opts *ServerOptions) []server.Route {
 			if err != nil {
 				return err
 			}
-			if err := validateHostCPU(req, exe); err != nil {
+			request, err := parseHostTask(&req, exe)
+			if err != nil {
 				return response.ErrInvalidRequest.WithMessage(err.Error())
 			}
-			pid, _ := strconv.Atoi(req.TracerArgs[5])
-			op, _, err := opts.ProfilingService.Start(ctx.Request().Context(), &nodeprofiling.StartRequest{RequestID: req.RequestID, HostPID: pid, Duration: time.Duration(req.Timeout-20) * time.Second, Scope: observation.ScopeHost, Spec: profiling.Spec{Language: profiling.Language(req.TracerArgs[3]), Type: profiling.TypeCPU, Mode: profiling.ModeOnCPU}})
+			op, _, err := opts.ProfilingService.Start(ctx.Request().Context(), request)
 			if err != nil {
 				return nodeAPIError(err)
 			}
