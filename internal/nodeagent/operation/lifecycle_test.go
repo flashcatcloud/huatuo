@@ -571,9 +571,9 @@ func TestSamplerFailureDetails(t *testing.T) {
 	if got := f.terminalMessage(KindTracing); got != messageExecutionFailed {
 		t.Fatal(got)
 	}
-	f.err = testSamplerError(strings.Repeat("错", 1000))
+	f.err = testSamplerError(strings.Repeat("错", 1000) + "\nBPF load failed")
 	got := f.terminalMessage(KindProfiling)
-	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasSuffix(got, "…") {
+	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, "BPF load failed") {
 		t.Fatalf("invalid truncated diagnostic (%d bytes)", len(got))
 	}
 }

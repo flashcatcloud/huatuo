@@ -252,11 +252,11 @@ func (f *lifecycleFailure) terminalMessage(kind Kind) string {
 		return f.message
 	}
 	if len(message) > limit {
-		end := limit - len("…")
-		for !utf8.RuneStart(message[end]) {
-			end--
+		start := len(message) - limit + len("…")
+		for !utf8.RuneStart(message[start]) {
+			start++
 		}
-		message = message[:end] + "…"
+		message = "…" + message[start:]
 	}
 	return message
 }
