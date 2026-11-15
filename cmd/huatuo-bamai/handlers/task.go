@@ -16,12 +16,6 @@ package handlers
 
 import (
 	"errors"
-	"github.com/ccfos/huatuo/internal/nodeagent/operation"
-	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
-	"github.com/ccfos/huatuo/internal/server"
-	"github.com/ccfos/huatuo/internal/server/response"
-	"github.com/ccfos/huatuo/pkg/observation"
-	"github.com/ccfos/huatuo/pkg/profiling"
 	"net"
 	"net/http"
 	"os"
@@ -30,6 +24,13 @@ import (
 	"slices"
 	"strconv"
 	"time"
+
+	"github.com/ccfos/huatuo/internal/nodeagent/operation"
+	nodeprofiling "github.com/ccfos/huatuo/internal/nodeagent/profiling"
+	"github.com/ccfos/huatuo/internal/server"
+	"github.com/ccfos/huatuo/internal/server/response"
+	"github.com/ccfos/huatuo/pkg/observation"
+	"github.com/ccfos/huatuo/pkg/profiling"
 )
 
 type NewTaskReq struct {
@@ -42,7 +43,7 @@ type NewTaskReq struct {
 
 var hostJobID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$`)
 
-func parseHostTask(req NewTaskReq, executable string) (*nodeprofiling.StartRequest, error) {
+func parseHostTask(req *NewTaskReq, executable string) (*nodeprofiling.StartRequest, error) {
 	a := req.TracerArgs
 	invalid := errors.New("invalid host profiling arguments: expected a supported mode with package-owned tools and output")
 	if req.TracerName != "profiler" || req.DataType != "db-json" || !hostJobID.MatchString(req.RequestID) ||
@@ -127,7 +128,7 @@ func hostTaskRoutes(opts *ServerOptions) []server.Route {
 			if err != nil {
 				return err
 			}
-			request, err := parseHostTask(req, exe)
+			request, err := parseHostTask(&req, exe)
 			if err != nil {
 				return response.ErrInvalidRequest.WithMessage(err.Error())
 			}
