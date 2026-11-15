@@ -17,6 +17,8 @@ package operation
 import (
 	"context"
 	"errors"
+	"strings"
+	"unicode/utf8"
 
 	"github.com/ccfos/huatuo/internal/log"
 )
@@ -226,13 +228,37 @@ func (m *Manager) commitTerminalLocked(
 		managed.state.Terminal = &TerminalResult{
 			Outcome: outcome,
 			Reason:  failure.reason,
-			Message: failure.message,
+			Message: failure.terminalMessage(managed.state.Kind),
 		}
 	}
 	managed.isFinalizing = false
 	managed.expiresAt = finishedAt.Add(m.lifecycle.TerminalRetentionPeriod)
 	managed.execution = nil
 	m.activeCount--
+}
+
+// Keep sampler diagnostics within the task response budget.
+func (f *lifecycleFailure) terminalMessage(kind Kind) string {
+	if kind != KindProfiling || f.err == nil || (f.phase != "start" && f.phase != "wait") {
+		return f.message
+	}
+	var diagnostic interface{ SamplerOutput() string }
+	if !errors.As(f.err, &diagnostic) {
+		return f.message
+	}
+	const limit = 2048
+	message := strings.ToValidUTF8(strings.TrimSpace(diagnostic.SamplerOutput()), "�")
+	if message == "" {
+		return f.message
+	}
+	if len(message) > limit {
+		end := limit - len("…")
+		for !utf8.RuneStart(message[end]) {
+			end--
+		}
+		message = message[:end] + "…"
+	}
+	return message
 }
 
 func (m *Manager) logFailure(requestID string, kind Kind, failure *lifecycleFailure) {

@@ -44,7 +44,7 @@ func buildCommand(request *StartRequest, config *Config) (executil.Spec, error) 
 	}
 	if request.HostPID > 0 {
 		args = append(args, "--pid", strconv.Itoa(request.HostPID))
-		if request.Spec.Language == profilingdomain.LanguageGo || request.Spec.Language == profilingdomain.LanguageCPP {
+		if request.Spec.Language == profilingdomain.LanguageC || request.Spec.Language == profilingdomain.LanguageGo || request.Spec.Language == profilingdomain.LanguageCPP {
 			args = append(args, "--thread-group")
 		}
 	}
@@ -55,6 +55,9 @@ func buildCommand(request *StartRequest, config *Config) (executil.Spec, error) 
 	case profilingdomain.TypeCPU:
 		if request.Spec.Mode == profilingdomain.ModeOffCPU {
 			args = append(args, "--cpu-mode", string(request.Spec.Mode))
+			if request.OffCPUPhase != "" {
+				args = append(args, "--offcpu-phase", string(request.OffCPUPhase))
+			}
 		}
 	case profilingdomain.TypeMemory:
 		args = append(args, "--memory-mode", string(request.Spec.Mode))

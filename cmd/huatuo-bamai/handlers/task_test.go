@@ -33,7 +33,7 @@ func TestHostCPURequest(t *testing.T) {
 		args = append(args, "--tracer-id", "cp-1", "--duration", "30", "--aggr-interval", window, "--max-concurrent-procs", "10", "--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock")
 		req := NewTaskReq{RequestID: "cp-1", TracerName: "profiler", Timeout: 50, DataType: "db-json", TracerArgs: args}
 		exe := "/opt/huatuo/bin/huatuo-bamai"
-		if err := validateHostCPU(req, exe); err != nil {
+		if _, err := parseHostTask(req, exe); err != nil {
 			t.Fatalf("%s: %v", lang, err)
 		}
 		for _, mutate := range []func(*NewTaskReq){
@@ -47,9 +47,27 @@ func TestHostCPURequest(t *testing.T) {
 			bad := req
 			bad.TracerArgs = append([]string(nil), args...)
 			mutate(&bad)
-			if validateHostCPU(bad, exe) == nil {
+			if _, err := parseHostTask(bad, exe); err == nil {
 				t.Fatalf("accepted unexpected request %v", bad)
 			}
+		}
+	}
+}
+
+func TestParseHostNativeModes(t *testing.T) {
+	for _, tc := range []struct {
+		flags       []string
+		mode, phase string
+	}{
+		{[]string{"memory", "--memory-mode", "physical_alloc"}, "physical_alloc", ""},
+		{[]string{"cpu", "--cpu-mode", "offcpu", "--offcpu-phase", "blocked"}, "offcpu", "blocked"},
+		{[]string{"cpu", "--cpu-mode", "offcpu", "--offcpu-phase", "runqueue"}, "offcpu", "runqueue"},
+	} {
+		args := append([]string{"-t"}, tc.flags...)
+		args = append(args, "-l", "c++", "--pid", "42", "--thread-group", "--tracer-id", "test", "--duration", "30", "--aggr-interval", "10", "--max-concurrent-procs", "10", "--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock")
+		req, err := parseHostTask(NewTaskReq{RequestID: "test", TracerName: "profiler", DataType: "db-json", Timeout: 50, TracerArgs: args}, "")
+		if err != nil || req.HostPID != 42 || string(req.Spec.Mode) != tc.mode || string(req.OffCPUPhase) != tc.phase {
+			t.Fatalf("%v: request=%+v err=%v", tc.flags, req, err)
 		}
 	}
 }
