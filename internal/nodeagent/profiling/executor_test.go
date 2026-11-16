@@ -20,6 +20,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -212,5 +213,25 @@ func TestExecutorStopAndFinalizeKeepExecutionSeparate(t *testing.T) {
 				t.Fatalf("Finalize repeated execution failure: %v", err)
 			}
 		})
+	}
+}
+
+func TestSamplerExitCauseWithAndWithoutOutput(t *testing.T) {
+	for _, output := range []string{"", "last BPF diagnostic"} {
+		process, err := executil.New(executil.Spec{Path: "/bin/sh", Args: []string{"-c", `printf '%s' "$1" >&2; kill -KILL "$$"`, "sampler", output}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := process.Start(t.Context()); err != nil {
+			t.Fatal(err)
+		}
+		err = (&executor{process: process}).Wait()
+		var failure *samplerError
+		if !errors.As(err, &failure) || !strings.Contains(failure.Unwrap().Error(), "signal: killed") || failure.SamplerOutput() != output {
+			t.Fatalf("output %q: unexpected failure %v", output, err)
+		}
+		if err := process.Close(); err != nil {
+			t.Fatal(err)
+		}
 	}
 }
