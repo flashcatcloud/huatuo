@@ -242,23 +242,38 @@ func (f *lifecycleFailure) terminalMessage(kind Kind) string {
 	if kind != KindProfiling || f.err == nil || (f.phase != "start" && f.phase != "wait") {
 		return f.message
 	}
-	var diagnostic interface{ SamplerOutput() string }
+	var diagnostic interface {
+		error
+		Unwrap() error
+		SamplerOutput() string
+	}
 	if !errors.As(f.err, &diagnostic) {
 		return f.message
 	}
 	const limit = 2048
-	message := strings.ToValidUTF8(strings.TrimSpace(diagnostic.SamplerOutput()), "�")
-	if message == "" {
+	cause := diagnostic.Unwrap()
+	if cause == nil {
 		return f.message
 	}
-	if len(message) > limit {
-		start := len(message) - limit + len("…")
-		for !utf8.RuneStart(message[start]) {
-			start++
-		}
-		message = "…" + message[start:]
+	// Reserve room for both the exit cause and the tail of the sampler output.
+	reason := diagnosticTail(cause.Error(), limit/2)
+	output := diagnosticTail(diagnostic.SamplerOutput(), limit-len(reason)-1)
+	if output == "" {
+		return reason
 	}
-	return message
+	return reason + "\n" + output
+}
+
+func diagnosticTail(text string, limit int) string {
+	message := strings.ToValidUTF8(strings.TrimSpace(text), "�")
+	if len(message) <= limit {
+		return message
+	}
+	start := len(message) - limit + len("…")
+	for !utf8.RuneStart(message[start]) {
+		start++
+	}
+	return "…" + message[start:]
 }
 
 func (m *Manager) logFailure(requestID string, kind Kind, failure *lifecycleFailure) {

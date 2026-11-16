@@ -560,20 +560,25 @@ func equalStrings(left, right []string) bool {
 
 type testSamplerError string
 
+func (e testSamplerError) Unwrap() error         { return errors.New("wait for profiler: signal: killed") }
 func (e testSamplerError) Error() string         { return string(e) }
 func (e testSamplerError) SamplerOutput() string { return string(e) }
 
 func TestSamplerFailureDetails(t *testing.T) {
 	f := lifecycleFailure{phase: "wait", message: messageExecutionFailed, err: testSamplerError("open bpf/native_physical_alloc.o: no such file or directory")}
-	if got := f.terminalMessage(KindProfiling); got != f.err.Error() {
+	if got := f.terminalMessage(KindProfiling); got != "wait for profiler: signal: killed\n"+f.err.Error() {
 		t.Fatal(got)
 	}
 	if got := f.terminalMessage(KindTracing); got != messageExecutionFailed {
 		t.Fatal(got)
 	}
+	f.err = testSamplerError("  ")
+	if got := f.terminalMessage(KindProfiling); got != "wait for profiler: signal: killed" {
+		t.Fatal(got)
+	}
 	f.err = testSamplerError(strings.Repeat("错", 1000) + "\nBPF load failed")
 	got := f.terminalMessage(KindProfiling)
-	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasPrefix(got, "…") || !strings.HasSuffix(got, "BPF load failed") {
+	if len(got) > 2048 || !utf8.ValidString(got) || !strings.HasPrefix(got, "wait for profiler: signal: killed\n…") || !strings.HasSuffix(got, "BPF load failed") {
 		t.Fatalf("invalid truncated diagnostic (%d bytes)", len(got))
 	}
 }

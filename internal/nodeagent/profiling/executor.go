@@ -113,9 +113,6 @@ func (e *executor) withOutput(action string, err error) error {
 		}
 		output = append(output, stderr...)
 	}
-	if len(output) == 0 {
-		return fmt.Errorf("%s: %w", action, err)
-	}
 	return &samplerError{cause: fmt.Errorf("%s: %w", action, err), output: string(output)}
 }
 
@@ -124,6 +121,11 @@ type samplerError struct {
 	output string
 }
 
-func (e *samplerError) Error() string         { return e.cause.Error() + "; output: " + e.output }
+func (e *samplerError) Error() string {
+	if e.output == "" {
+		return e.cause.Error()
+	}
+	return e.cause.Error() + "; output: " + e.output
+}
 func (e *samplerError) Unwrap() error         { return e.cause }
 func (e *samplerError) SamplerOutput() string { return e.output }
