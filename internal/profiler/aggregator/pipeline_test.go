@@ -17,8 +17,12 @@ package aggregator
 import (
 	"context"
 	"errors"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/mock"
 
 	profctx "github.com/ccfos/huatuo/internal/profiler/context"
 	"github.com/ccfos/huatuo/internal/profiler/output"
@@ -200,4 +204,64 @@ func TestPipelineAggregateAndExport_EmptyFormatter(t *testing.T) {
 	}
 
 	aggr.AssertNotCalled(t, "Reset")
+}
+
+func TestPipelineEnqueueAcknowledged(t *testing.T) {
+	p := NewPipeline(&profctx.ProfilerContext{}, NewMockAggregator(t))
+	p.queue = make(chan any, 1)
+	if err := p.EnqueueAcknowledged("accepted"); err != nil {
+		t.Fatal(err)
+	}
+	if err := p.EnqueueAcknowledged("retry"); err == nil {
+		t.Fatal("full queue acknowledged rejected record")
+	}
+	if got := <-p.queue; got != "accepted" {
+		t.Fatalf("queued %v, want accepted", got)
+	}
+	if err := p.EnqueueAcknowledged("retry"); err != nil {
+		t.Fatal(err)
+	}
+	if got := <-p.queue; got != "retry" {
+		t.Fatalf("queued %v, want retry", got)
+	}
+	if p.overflowCount.Load() != 0 {
+		t.Fatal("acknowledged rejection counted as a silently dropped record")
+	}
+	p.Stop()
+	if err := p.EnqueueAcknowledged("stopped"); err == nil {
+		t.Fatal("stopped queue acknowledged a record")
+	}
+	if len(p.queue) != 0 {
+		t.Fatal("stopped queue accepted a record")
+	}
+}
+
+func TestPipelineAcknowledgedEnqueueRacesStop(t *testing.T) {
+	var accepted, aggregated atomic.Int64
+	aggr := NewMockAggregator(t)
+	aggr.On("Aggregate", "window").Run(func(_ mock.Arguments) { aggregated.Add(1) }).Maybe()
+	aggr.On("OutputFormatter").Return(nil).Once()
+	p := NewPipeline(&profctx.ProfilerContext{Ctx: t.Context(), OutputFormat: output.FormatCollapsed}, aggr)
+	p.Start()
+	if err := p.EnqueueAcknowledged("window"); err != nil {
+		t.Fatal(err)
+	}
+	accepted.Add(1)
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 1000 {
+				if p.EnqueueAcknowledged("window") == nil {
+					accepted.Add(1)
+				}
+			}
+		}()
+	}
+	p.Stop()
+	wg.Wait()
+	if accepted.Load() != aggregated.Load() {
+		t.Fatalf("accepted %d, aggregated %d", accepted.Load(), aggregated.Load())
+	}
 }

@@ -200,6 +200,23 @@ func (p *Pipeline) Enqueue(data any) {
 	}
 }
 
+// EnqueueAcknowledged confirms queue acceptance, not aggregation or durable export.
+// Callers must retain their input when the queue is full or stopped.
+func (p *Pipeline) EnqueueAcknowledged(data any) error {
+	p.enqueueMutex.RLock()
+	defer p.enqueueMutex.RUnlock()
+
+	if p.state.Load() == pipelineStateStopped {
+		return fmt.Errorf("profiling queue is stopped; retain uncollected output")
+	}
+	select {
+	case p.queue <- data:
+		return nil
+	default:
+		return fmt.Errorf("profiling queue is full; retain uncollected output")
+	}
+}
+
 func (p *Pipeline) logAggregateExportError(err error) {
 	log.WithError(err).WithField("tracer_id", p.tracerID).Errorf("aggregate and export failed")
 }

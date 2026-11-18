@@ -9,6 +9,21 @@ weight: 50
 
 ## Unreleased
 
+### Upgrade notes
+
+- Java profiling now requires the bundled async-profiler 4.5 window-completion
+  agent. Restart JVMs that already loaded an older agent; replacing its file
+  alone cannot update a loaded library. Building the bundled agent requires Docker.
+- Java window files and completion markers remain in the target JVM's `/tmp`
+  for crash recovery, including after queue acceptance. Confirm export or recover
+  the session before cleaning them up; queue acceptance is not durable storage.
+
+### Fixed
+
+- Java timeout and explicit stop now finalize each window once. Queue-full and
+  stopped-queue failures preserve unaccepted windows and report incomplete
+  delivery instead of silently dropping data. Loop sampling gaps remain unchanged.
+
 ### Added
 
 - Added `tcpshark --with-dropwatch --bpf-path-dir <dir>` to correlate TCP

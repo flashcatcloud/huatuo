@@ -15,130 +15,97 @@
 package java
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/ccfos/huatuo/internal/profiler"
 )
 
 func TestCollapsedFileCollectorConsumesEachFileOnce(t *testing.T) {
-	t.Parallel()
-
 	dir := t.TempDir()
 	path := filepath.Join(dir, "profile-0.collapsed")
-	if err := os.WriteFile(path, []byte("first 1\n"), 0o600); err != nil {
-		t.Fatalf("write collapsed output: %v", err)
+	if err := os.WriteFile(path, []byte("first 17\n"), 0o600); err != nil {
+		t.Fatal(err)
 	}
-	opt := &AsprofSamplingOption{
-		Pids:         []int{1234},
-		AggrInterval: time.Second,
-		StartedAt:    time.Unix(100, 0),
+	samples, c := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{1234: filepath.Join(dir, "profile-*.collapsed")})
+	for range 3 {
+		if err := c.scanOutputFiles(); err != nil {
+			t.Fatal(err)
+		}
 	}
-	samples, collector := newTestCollapsedFileCollector(t, opt.Pids, map[int]string{
-		1234: filepath.Join(dir, "profile-*.collapsed"),
-	})
-	if err := collector.scanOutputFiles(false); err != nil {
-		t.Fatalf("first scan: %v", err)
+	if len(*samples) != 1 || (*samples)[0].Output != "first 17\n" {
+		t.Fatalf("samples: %v", *samples)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("recovery file removed: %v", err)
+	}
+}
+
+func TestCollapsedFileCollectorCompletion(t *testing.T) {
+	for _, tc := range []struct {
+		name, marker            string
+		sequences               []int
+		wantComplete, wantError bool
+	}{
+		{"missing marker", "", []int{0}, false, false},
+		{"complete", "window-completion-v1\n1\n", []int{0, 1}, true, false},
+		{"empty window", "window-completion-v1\n0\n", []int{0}, true, false},
+		{"gap", "window-completion-v1\n2\n", []int{0, 2}, false, true},
+		{"missing tail", "window-completion-v1\n2\n", []int{0, 1}, false, true},
+		{"invalid marker", "window-completion-v1\nx\n", []int{0}, false, true},
+		{"invalid protocol", "unknown\n0\n", []int{0}, false, true},
+		{"overflow", "window-completion-v1\n18446744073709551615\n", []int{0}, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, seq := range tc.sequences {
+				if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("profile-%d.collapsed", seq)), nil, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if tc.marker != "" {
+				if err := os.WriteFile(filepath.Join(dir, "profile.complete"), []byte(tc.marker), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, c := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{1234: filepath.Join(dir, "profile-*.collapsed")})
+			if err := c.scanOutputFiles(); err != nil {
+				t.Fatal(err)
+			}
+			complete, err := c.complete()
+			if complete != tc.wantComplete || (err != nil) != tc.wantError {
+				t.Fatalf("complete=%v err=%v", complete, err)
+			}
+		})
+	}
+}
+
+func TestCollapsedFileCollectorIgnoresUnpublishedWindow(t *testing.T) {
+	dir := t.TempDir()
+	part := filepath.Join(dir, "profile-0.collapsed.part.123")
+	if err := os.WriteFile(part, []byte("work 9\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	samples, c := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{1234: filepath.Join(dir, "profile-*.collapsed")})
+	for range 3 {
+		if err := c.scanOutputFiles(); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if len(*samples) != 0 {
-		t.Fatalf("first observation enqueued samples=%d", len(*samples))
+		t.Fatal("read unpublished window")
 	}
-	if err := collector.scanOutputFiles(false); err != nil {
-		t.Fatalf("stable scan: %v", err)
+	if err := os.Rename(part, filepath.Join(dir, "profile-0.collapsed")); err != nil {
+		t.Fatal(err)
 	}
-	if len(*samples) != 1 {
-		t.Fatalf("stable file enqueued samples=%d, want 1", len(*samples))
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("consumed output stat error=%v, want not exist", err)
-	}
-	if err := collector.scanOutputFiles(false); err != nil {
-		t.Fatalf("scan removed output: %v", err)
+	if err := c.scanOutputFiles(); err != nil {
+		t.Fatal(err)
 	}
 	if len(*samples) != 1 {
-		t.Fatalf("removed output enqueued again: samples=%d", len(*samples))
-	}
-}
-
-func TestCollapsedFileCollectorRetriesRemovalWithoutDuplicateSample(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	path := filepath.Join(dir, "profile-0.collapsed")
-	if err := os.WriteFile(path, []byte("first 1\n"), 0o600); err != nil {
-		t.Fatalf("write collapsed output: %v", err)
-	}
-	if err := os.Chmod(dir, 0o500); err != nil {
-		t.Fatalf("make output directory read-only: %v", err)
-	}
-	t.Cleanup(func() {
-		if err := os.Chmod(dir, 0o700); err != nil {
-			t.Errorf("restore output directory permissions: %v", err)
-		}
-	})
-
-	samples, collector := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{
-		1234: filepath.Join(dir, "profile-*.collapsed"),
-	})
-	if err := collector.scanOutputFiles(true); err != nil {
-		t.Fatalf("scan output with removal failure: %v", err)
-	}
-	if len(*samples) != 1 {
-		t.Fatalf("enqueued samples=%d, want 1", len(*samples))
-	}
-	if err := collector.scanOutputFiles(true); err != nil {
-		t.Fatalf("rescan retained output: %v", err)
-	}
-	if len(*samples) != 1 {
-		t.Fatalf("retained output enqueued again: samples=%d", len(*samples))
-	}
-
-	if err := os.Chmod(dir, 0o700); err != nil {
-		t.Fatalf("restore output directory permissions: %v", err)
-	}
-	if err := os.WriteFile(path, []byte("second 22\n"), 0o600); err != nil {
-		t.Fatalf("replace collapsed output: %v", err)
-	}
-	if err := collector.scanOutputFiles(true); err != nil {
-		t.Fatalf("scan replacement output: %v", err)
-	}
-	if len(*samples) != 2 {
-		t.Fatalf("replacement output samples=%d, want 2", len(*samples))
-	}
-	if (*samples)[1].Output != "second 22\n" {
-		t.Fatalf("replacement output=%q, want %q", (*samples)[1].Output, "second 22\n")
-	}
-	if _, ok := collector.retainedFiles[path]; ok {
-		t.Fatalf("retained signature for removed output %q", path)
-	}
-}
-
-func TestCollapsedFileCollectorReadsFinalSequenceWithLoopFiles(t *testing.T) {
-	t.Parallel()
-
-	dir := t.TempDir()
-	for path, data := range map[string]string{
-		filepath.Join(dir, "profile-0.collapsed"): "loop 1\n",
-		filepath.Join(dir, "profile-4.collapsed"): "final 1\n",
-	} {
-		if err := os.WriteFile(path, []byte(data), 0o600); err != nil {
-			t.Fatalf("write collapsed output: %v", err)
-		}
-	}
-	samples, collector := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{
-		1234: filepath.Join(dir, "profile-*.collapsed"),
-	})
-
-	if err := collector.scanOutputFiles(true); err != nil {
-		t.Fatalf("scan output files: %v", err)
-	}
-	if len(*samples) != 2 {
-		t.Fatalf("enqueued samples=%d, want 2", len(*samples))
-	}
-	if (*samples)[0].Output != "loop 1\n" || (*samples)[1].Output != "final 1\n" {
-		t.Fatalf("outputs=(%q, %q), want loop then final", (*samples)[0].Output, (*samples)[1].Output)
+		t.Fatalf("published window count %d", len(*samples))
 	}
 }
 
@@ -208,7 +175,81 @@ func newTestCollapsedFileCollector(
 	collector := newCollapsedFileCollector(
 		pids,
 		pidsToFilePath,
-		func(sample profiler.SampleOutput) { *samples = append(*samples, sample) },
+		func(sample profiler.SampleOutput) error { *samples = append(*samples, sample); return nil },
 	)
 	return samples, collector
+}
+
+func TestCollapsedFileCollectorRetainsRejectedDelivery(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "profile-0.collapsed")
+	if err := os.WriteFile(path, []byte("work 17\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, collector := newTestCollapsedFileCollector(t, []int{1234}, map[int]string{1234: filepath.Join(dir, "profile-*.collapsed")})
+	rejected := errors.New("queue full")
+	collector.enqueueSample = func(profiler.SampleOutput) error { return rejected }
+	if err := collector.scanOutputFiles(); !errors.Is(err, rejected) {
+		t.Fatalf("scan: %v", err)
+	}
+	if data, err := os.ReadFile(path); err != nil || string(data) != "work 17\n" {
+		t.Fatalf("rejected window changed: %q %v", data, err)
+	}
+	accepted := 0
+	collector.enqueueSample = func(sample profiler.SampleOutput) error {
+		accepted++
+		if sample.Output != "work 17\n" {
+			t.Fatalf("output: %q", sample.Output)
+		}
+		return nil
+	}
+	for range 3 {
+		if err := collector.scanOutputFiles(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("accepted %d times", accepted)
+	}
+}
+
+func TestCollapsedFileCollectorMultiplePIDs(t *testing.T) {
+	paths := map[int]string{}
+	for _, pid := range []int{11, 22} {
+		dir := t.TempDir()
+		paths[pid] = filepath.Join(dir, "profile-*.collapsed")
+		if err := os.WriteFile(filepath.Join(dir, "profile-0.collapsed"), []byte("work 17\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, "profile.complete"), []byte("window-completion-v1\n0\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	samples, c := newTestCollapsedFileCollector(t, []int{11, 22}, paths)
+	accepted := c.enqueueSample
+	rejected := errors.New("queue full")
+	reject := true
+	c.enqueueSample = func(sample profiler.SampleOutput) error {
+		if sample.PID == 11 && reject {
+			return rejected
+		}
+		return accepted(sample)
+	}
+	if err := c.scanOutputFiles(); !errors.Is(err, rejected) {
+		t.Fatalf("scan: %v", err)
+	}
+	if len(*samples) != 1 || (*samples)[0].PID != 22 {
+		t.Fatalf("other PID not delivered independently: %v", *samples)
+	}
+	reject = false
+	// Completion also handles a marker observed before the next directory scan.
+	for range 3 {
+		complete, err := c.complete()
+		if err != nil || !complete {
+			t.Fatalf("complete=%v err=%v", complete, err)
+		}
+	}
+	if len(*samples) != 2 || (*samples)[1].PID != 11 {
+		t.Fatalf("retry delivery: %v", *samples)
+	}
 }
