@@ -15,12 +15,15 @@
 package provider
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ccfos/huatuo/internal/profiler"
 	pcontext "github.com/ccfos/huatuo/internal/profiler/context"
@@ -83,8 +86,9 @@ func TestPythonCPUProfilerReadDataLoopUsesOnlyMemfdSamples(t *testing.T) {
 		wantErr string
 	}{
 		{name: "samples with status messages", sample: "work (app.py:10) 3\n"},
-		{name: "no samples", wantErr: "no samples collected"},
-		{name: "whitespace", sample: " \n", wantErr: "no samples collected"},
+		{name: "no samples"},
+		{name: "whitespace", sample: " \n"},
+		{name: "malformed", sample: "not-a-stack\n", wantErr: "malformed sample output"},
 		{name: "failed command", sample: "partial 3\n", exit: 7, wantErr: "exit status 7"},
 	}
 	for _, tt := range tests {
@@ -111,6 +115,10 @@ func TestPythonCPUProfilerReadDataLoopUsesOnlyMemfdSamples(t *testing.T) {
 				return
 			}
 			require.NoError(t, err)
+			if strings.TrimSpace(tt.sample) == "" {
+				require.Empty(t, samples)
+				return
+			}
 			require.ElementsMatch(t, []profiler.SampleOutput{
 				{PID: 123, Output: tt.sample},
 				{PID: 456, Output: tt.sample},
@@ -127,7 +135,7 @@ func TestRunPySpyPreservesExitError(t *testing.T) {
 		t.Fatalf("runPySpy() error = %v, want exit status 7", results[0].Err)
 	}
 	require.Empty(t, results[0].Output)
-	require.Equal(t, "tool warning\n", string(results[0].Diagnostics))
+	require.Contains(t, string(results[0].Diagnostics), "tool warning\n")
 }
 
 func writeFakePySpy(t *testing.T, sample string, exitCode int) string {
@@ -145,7 +153,7 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%%s' '%s' > "$output"
 printf 'py-spy> Sampling process 99 times a second. Press Control-C to exit.\n'
-printf 'py-spy> Wrote raw flamegraph data. Samples: 0 Errors: 272\n'
+printf 'py-spy> Wrote raw flamegraph data. Samples: 0 Errors: 0\n'
 printf 'py-spy> You can use the flamegraph.pl script to generate a SVG\n'
 printf 'tool warning\n' >&2
 exit %d
@@ -166,4 +174,57 @@ func TestValidatePythonAggregationWindow(t *testing.T) {
 		validatePythonAggregationWindow(30, 10),
 		"Python CPU profiler does not support continuous profiling: aggregation interval (10s) must equal duration (30s)",
 	)
+}
+
+func TestPythonEmptyCompletionEvidence(t *testing.T) {
+	for _, tc := range []struct {
+		name, summary string
+		ok            bool
+	}{
+		{"empty", "py-spy> Wrote raw flamegraph data. Samples: 0 Errors: 0", true},
+		{"errors", "py-spy> Wrote raw flamegraph data. Samples: 0 Errors: 272", false},
+		{"lost data", "py-spy> Wrote raw flamegraph data. Samples: 3 Errors: 0", false},
+		{"missing", "", false},
+		{"malformed", "py-spy> Wrote raw flamegraph data. Samples: 0 Errors: ?", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeFakePySpy(t, "", 0)
+			path := filepath.Join(dir, "py-spy")
+			script, err := os.ReadFile(path)
+			require.NoError(t, err)
+			script = []byte(strings.ReplaceAll(string(script), "py-spy> Wrote raw flamegraph data. Samples: 0 Errors: 0", tc.summary))
+			require.NoError(t, os.WriteFile(path, script, 0o600))
+			p := &pythonCPUProfiler{duration: 1, freq: 99, toolPath: dir, pids: []int{123}}
+			err = p.ReadDataLoop(t.Context(), func(any) { t.Fatal("empty output enqueued") })
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestPythonCancellationRemainsFailure(t *testing.T) {
+	dir := writeFakePySpy(t, "", 0)
+	path := filepath.Join(dir, "py-spy")
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nexec sleep 10\n"), 0o600))
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	p := &pythonCPUProfiler{duration: 1, freq: 99, toolPath: dir, pids: []int{123}}
+	require.Error(t, p.ReadDataLoop(ctx, func(any) { t.Fatal("canceled output enqueued") }))
+}
+
+func TestPythonMixedPIDFailureRemainsFailure(t *testing.T) {
+	dir := writeFakePySpy(t, "", 0)
+	path := filepath.Join(dir, "py-spy")
+	script, err := os.ReadFile(path)
+	require.NoError(t, err)
+	// The final argument is the target PID; fail one target only.
+	script = []byte(strings.Replace(string(script), "set -eu", `set -eu
+for arg do last=$arg; done
+if [ "$last" = 456 ]; then echo denied >&2; exit 7; fi`, 1))
+	require.NoError(t, os.WriteFile(path, script, 0o600))
+	p := &pythonCPUProfiler{duration: 1, freq: 99, toolPath: dir, pids: []int{123, 456}}
+	require.ErrorContains(t, p.ReadDataLoop(t.Context(), func(any) { t.Fatal("empty output enqueued") }), "PID[456]")
 }

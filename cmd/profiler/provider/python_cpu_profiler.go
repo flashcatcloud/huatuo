@@ -18,10 +18,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/ccfos/huatuo/internal/executil"
 	"github.com/ccfos/huatuo/internal/process"
@@ -122,8 +123,16 @@ func (p *pythonCPUProfiler) ReadDataLoop(ctx context.Context, enqueue func(any))
 		}
 
 		if len(bytes.TrimSpace(cmdRes.Output)) == 0 {
-			errorMessages = append(errorMessages,
-				fmt.Sprintf("PID[%d] sampling failed: no samples collected", targetPid))
+			// py-spy may exit zero after failed stack reads. Only an explicit
+			// zero-sample, zero-error summary establishes a successful empty run.
+			if !pythonEmptySuccess(cmdRes.Diagnostics) {
+				errorMessages = append(errorMessages,
+					fmt.Sprintf("PID[%d] sampling failed: empty result without a zero-error completion summary, diagnostics: %q", targetPid, cmdRes.Diagnostics))
+			}
+			continue
+		}
+		if !validPythonSamples(string(cmdRes.Output)) {
+			errorMessages = append(errorMessages, fmt.Sprintf("PID[%d] sampling failed: malformed sample output", targetPid))
 			continue
 		}
 		enqueue(profiler.SampleOutput{
@@ -174,9 +183,29 @@ func runPySpy(
 	durStr := strconv.Itoa(dur)
 	freqStr := strconv.Itoa(freq)
 
-	return profilerexec.RunWithMemfd(ctx, pids, pyspyBin, func(pid int, outputPath string) []string {
-		return buildPySpyArgs(pid, durStr, freqStr, outputPath)
-	}, executil.WithStdout(io.Discard))
+	// Capture bounded status output separately for each PID. Unlike the generic
+	// memfd runner, Python needs stdout's completion summary to validate emptiness.
+	results := make([]*profilerexec.Result, len(pids))
+	var wg sync.WaitGroup
+	for i, pid := range pids {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			result := &profilerexec.Result{PID: pid, Command: pyspyBin}
+			output, err := executil.Run(ctx, executil.Spec{Path: pyspyBin, MaxStdoutBytes: 4096, MaxStderrBytes: 4096},
+				executil.WithMemfdOutput(16<<20, func(outputPath string) []string {
+					return buildPySpyArgs(pid, durStr, freqStr, outputPath)
+				}))
+			result.Err = err
+			result.Diagnostics = append(append(output.Stdout, '\n'), output.Stderr...)
+			if err == nil {
+				result.Output = output.Memfd
+			}
+			results[i] = result
+		}()
+	}
+	wg.Wait()
+	return results
 }
 
 func buildPySpyArgs(pid int, duration, frequency, outputPath string) []string {
@@ -189,4 +218,24 @@ func buildPySpyArgs(pid int, duration, frequency, outputPath string) []string {
 		"-o", outputPath,
 		"-p", strconv.Itoa(pid),
 	}
+}
+
+var pythonCompletion = regexp.MustCompile(`(?m)^py-spy> Wrote raw flamegraph data[^\r\n]* Samples: ([0-9]+) Errors: ([0-9]+)\r?$`)
+
+func pythonEmptySuccess(diagnostics []byte) bool {
+	summaries := pythonCompletion.FindAllSubmatch(diagnostics, -1)
+	return len(summaries) == 1 && string(summaries[0][1]) == "0" && string(summaries[0][2]) == "0"
+}
+
+func validPythonSamples(raw string) bool {
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		_, count, ok := parseCollapsedLine(line)
+		if !ok || count <= 0 {
+			return false
+		}
+	}
+	return true
 }
