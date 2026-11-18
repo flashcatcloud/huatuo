@@ -130,3 +130,10 @@ func (p *cpuJavaProfiler) ReadDataLoop(ctx context.Context, enqueue func(any)) e
 	}
 	return javaruntime.ReadAsprofDataLoop(ctx, p.samplingOpt, p.profileOutFile, enqueue)
 }
+
+func (p *cpuJavaProfiler) ReadDataLoopAcknowledged(ctx context.Context, enqueue func(any) error) error {
+	if p.samplingOpt == nil {
+		return fmt.Errorf("read Java CPU profile: profiler is not started")
+	}
+	return javaruntime.ReadAsprofDataLoopAcknowledged(ctx, p.samplingOpt, p.profileOutFile, enqueue)
+}

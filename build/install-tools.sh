@@ -89,5 +89,7 @@ chmod 0755 "$WORK_DIR/tools/py-spy"
 		exit 1
 	}
 
+bash "$ROOT_DIR/build/async-profiler/build.sh" "$WORK_DIR/tools" "$ASYNC_PROFILER_ARCH"
+
 rm -rf "$TOOLS_DIR"
 mv "$WORK_DIR/tools" "$TOOLS_DIR"

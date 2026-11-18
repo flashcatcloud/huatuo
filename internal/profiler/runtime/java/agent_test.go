@@ -184,6 +184,7 @@ func TestStartAsprofCallbackBuildsStartCommand(t *testing.T) {
 		"-e", "cpu",
 		"--timeout", "20s",
 		"--loop", "10s",
+		"--completion", "/tmp/huatuo-asprof-session123-cpu-999999999.complete",
 		"-o", "collapsed",
 		"-f", "/tmp/huatuo-asprof-session123-cpu-999999999-%n{4}.collapsed",
 		"999999999",
@@ -222,17 +223,11 @@ func TestAsprofOutputFileCount(t *testing.T) {
 	}
 }
 
-func TestStopWithOutputArgsBuildsCollapsedOutputCommand(t *testing.T) {
+func TestFinishArgsIdentifySession(t *testing.T) {
 	t.Parallel()
 
-	got := stopWithOutputArgs(1234, "session123", "mem", 4)
-	want := []string{
-		"stop",
-		"--libpath", "/tmp/libasyncProfiler.so",
-		"-o", "collapsed",
-		"-f", "/tmp/huatuo-asprof-session123-mem-1234-4.collapsed",
-		"1234",
-	}
+	got := finishArgs(1234, "session123", "mem")
+	want := []string{"load", "1234", "/tmp/libasyncProfiler.so", "true", "finish,completion=/tmp/huatuo-asprof-session123-mem-1234.complete"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("stopWithOutputArgs()=%q, want %q", got, want)
 	}
@@ -276,5 +271,31 @@ func assertNoAgentTempFiles(t *testing.T, dir string) {
 	}
 	if len(tempFiles) != 0 {
 		t.Fatalf("temporary Java agent files=%q, want none", tempFiles)
+	}
+}
+
+func TestVerifyWindowProtocolUsesLoadedAgent(t *testing.T) {
+	for _, version := range []string{"4.5", "4.5 window-completion-v10", "4.5 window-completion-v1"} {
+		t.Run(version, func(t *testing.T) {
+			tool := t.TempDir()
+			if err := os.Mkdir(filepath.Join(tool, "bin"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			script := "#!/bin/sh\n[ \"$1\" = load ] && [ \"$4\" = true ] || exit 1\nprintf '%s' '" + version + "' > \"${5#version,file=}\"\n"
+			if err := os.WriteFile(filepath.Join(tool, "bin", "asprof"), []byte(script), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(filepath.Join(tool, "bin", "asprof"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			opt := &AsprofSamplingOption{ToolPath: tool, SessionID: filepath.Base(tool), OutFilePrefix: "version-test"}
+			err := verifyWindowProtocol(t.Context(), opt, 999999999)
+			if (err == nil) != (version == "4.5 window-completion-v1") {
+				t.Fatalf("version %q: %v", version, err)
+			}
+			if _, err := os.Stat(completionPath(opt.SessionID, opt.OutFilePrefix, 999999999) + ".version"); !os.IsNotExist(err) {
+				t.Fatalf("version probe left output: %v", err)
+			}
+		})
 	}
 }

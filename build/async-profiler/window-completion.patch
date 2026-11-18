@@ -1,0 +1,279 @@
+--- a/src/arguments.h
++++ b/src/arguments.h
+@@ -36,7 +36,8 @@
+     ACTION_STATUS,
+     ACTION_METRICS,
+     ACTION_LIST,
+-    ACTION_VERSION
++    ACTION_VERSION,
++    ACTION_FINISH
+ };
+ 
+ enum SHORT_ENUM Counter {
+@@ -176,6 +177,7 @@
+     int _jstackdepth;
+     int _truncated_stack_depth;
+     int _signal;
++    const char* _completion;
+     const char* _file;
+     const char* _log;
+     const char* _loglevel;
+@@ -240,6 +242,7 @@
+         _jstackdepth(DEFAULT_JSTACKDEPTH),
+         _truncated_stack_depth(DEFAULT_JSTACKDEPTH),
+         _signal(0),
++        _completion(NULL),
+         _file(NULL),
+         _log(NULL),
+         _loglevel(NULL),
+--- a/src/arguments.cpp
++++ b/src/arguments.cpp
+@@ -64,6 +64,12 @@
+ 
+             CASE("resume")
+                 _action = ACTION_RESUME;
++
++            CASE("finish")
++                _action = ACTION_FINISH;
++
++            CASE("completion")
++                _completion = value;
+ 
+             CASE("stop")
+                 _action = ACTION_STOP;
+@@ -417,6 +423,11 @@
+         _event = EVENT_CPU;
+     }
+ 
++    if (_completion != NULL && (_completion[0] != '/' ||
++        (_action != ACTION_FINISH && (_output != OUTPUT_COLLAPSED || _file == NULL ||
++         _timeout <= 0 || _loop <= 0 || strstr(_file, "%n") == NULL)))) {
++        return Error("Completion requires an absolute marker path, collapsed windows and positive loop/timeout");
++    }
+     if (_file != NULL && _output == OUTPUT_NONE) {
+         _output = detectOutputFormat(_file);
+         if (_output == OUTPUT_SVG) {
+--- a/src/profiler.h
++++ b/src/profiler.h
+@@ -49,6 +49,11 @@
+ class Profiler {
+   private:
+     Mutex _state_lock;
++    bool _window_published = false;
++    bool _window_complete = false;
++    const char* _window_error = NULL;
++    Error publishWindow(Arguments& args, bool terminal);
++    Error finishWindows(const char* completion);
+     State _state;
+     Trap _begin_trap;
+     Trap _end_trap;
+--- a/src/profiler.cpp
++++ b/src/profiler.cpp
+@@ -4,6 +4,7 @@
+  */
+ 
+ #include <algorithm>
++#include <string>
+ #include <assert.h>
+ #include <dlfcn.h>
+ #include <unistd.h>
+@@ -863,8 +864,19 @@
+         }
+     }
+ 
+-    // Save the arguments for shutdown or restart
++    if (args._file_num == 0 && _global_args._completion != NULL && !_window_complete) {
++        return Error("Finish the previous window session before starting another");
++    }
++    if (args._completion != NULL && args._file_num == 0) {
++        _window_complete = false;
++        _window_error = NULL;
++    }
++    _window_published = false;
++
++    // A failed initial start must not reserve a pending window session.
++    const char* completion = args._completion;
+     args.save();
++    if (args._file_num == 0) _global_args._completion = NULL;
+ 
+     if (reset || _start_time == 0) {
+         // Reset counters
+@@ -1013,6 +1025,7 @@
+     switchThreadEvents(JVMTI_ENABLE);
+ 
+     _state = RUNNING;
++    _global_args._completion = completion;
+     _start_time = OS::micros();
+     _epoch++;
+ 
+@@ -1489,7 +1502,10 @@
+         }
+ 
+         if ((current_micros = OS::micros()) >= loop_limit) {
+-            expire(_global_args, current_micros < _stop_time);
++            MutexLocker ml(_state_lock);
++            // A finish followed by a new start must not let this old timer
++            // expire the replacement session while waiting for the lock.
++            if (_timer_id == timer_id) expire(_global_args, OS::micros() < _stop_time);
+             return;
+         }
+ 
+@@ -1534,7 +1550,11 @@
+             }
+             break;
+         }
++        case ACTION_FINISH:
++            return finishWindows(args._completion);
+         case ACTION_STOP: {
++            MutexLocker ml(_state_lock);
++            if (_global_args._completion != NULL) return finishWindows(_global_args._completion);
+             Error error = stop();
+             if (args._output == OUTPUT_NONE) {
+                 if (error) {
+@@ -1595,7 +1615,7 @@
+             break;
+         }
+         case ACTION_VERSION:
+-            out << PROFILER_VERSION;
++            out << PROFILER_VERSION << " window-completion-v1";
+             break;
+         default:
+             break;
+@@ -1621,6 +1641,28 @@
+ Error Profiler::expire(Arguments& args, bool restart) {
+     MutexLocker ml(_state_lock);
+ 
++    if (args._completion != NULL) {
++        if (_window_error != NULL && restart) return Error(_window_error);
++        if (_window_complete) return _window_error == NULL ? Error::OK : Error(_window_error);
++        if (_state == RUNNING) {
++            Error error = stop(restart);
++            if (error) return error;
++        }
++        Error error = publishWindow(args, !restart);
++        if (error) {
++            if (restart) _window_error = "Window publication failed before the deadline";
++            return error;
++        }
++        if (!restart) return _window_error == NULL ? Error::OK : Error(_window_error);
++        // Publication may outlast the remaining budget. Finish this window
++        // instead of briefly starting an already-expired recording.
++        if (OS::micros() >= _stop_time) return publishWindow(args, true);
++        args._fdtransfer = false;
++        args._file_num++;
++        error = start(args, true);
++        if (error) _window_error = "Failed to restart window sampling";
++        return error;
++    }
+     Error error = stop(restart);
+     if (error) {
+         return error;
+@@ -1643,6 +1685,60 @@
+         return start(args, true);
+     }
+ 
++    return Error::OK;
++}
++
++// Both the timer and explicit finish publish under the same state lock.
++Error Profiler::finishWindows(const char* completion) {
++    MutexLocker ml(_state_lock);
++    if (completion == NULL || _global_args._completion == NULL ||
++        strcmp(completion, _global_args._completion) != 0) {
++        return Error("Window session does not match");
++    }
++    return expire(_global_args, false);
++}
++
++Error Profiler::publishWindow(Arguments& args, bool terminal) {
++#ifdef WINDOW_PROTOCOL_TESTING
++    // Test-only barrier: the controller can be killed after the JVM owns finish.
++    const char* gate = getenv(terminal ? "ASPROF_FINISH_GATE" : "ASPROF_WINDOW_GATE");
++    if (gate != NULL && access(gate, F_OK) != 0) {
++        std::string entered = std::string(gate) + ".entered";
++        FILE* marker = fopen(entered.c_str(), "w");
++        if (marker != NULL) fclose(marker);
++        for (int i = 0; i < 3000 && access(gate, F_OK) != 0; i++) OS::sleep(10000000);
++    }
++#endif
++    if (!_window_published) {
++        std::string path(args.file());
++        std::string temporary = path + ".part.XXXXXX";
++        std::vector<char> name(temporary.begin(), temporary.end());
++        name.push_back(0);
++        int fd = mkstemp(name.data());
++        if (fd < 0) return Error("Cannot create pending window");
++        FileWriter out(fd);
++        Error error = dump(out, args);
++        bool written = out.finish();
++        if (error || !written || rename(name.data(), path.c_str()) != 0) {
++            unlink(name.data());
++            return error ? error : Error("Cannot publish complete window");
++        }
++        _window_published = true;
++    }
++    if (terminal && !_window_complete) {
++        std::string temporary = std::string(args._completion) + ".part.XXXXXX";
++        std::vector<char> name(temporary.begin(), temporary.end());
++        name.push_back(0);
++        int fd = mkstemp(name.data());
++        if (fd < 0) return Error("Cannot create completion marker");
++        FileWriter out(fd);
++        out << "window-completion-v1\n" << (u64)args._file_num << "\n";
++        if (!out.finish() || rename(name.data(), args._completion) != 0) {
++            unlink(name.data());
++            return Error("Cannot publish completion marker");
++        }
++        _window_complete = true;
++    }
+     return Error::OK;
+ }
+ 
+@@ -1660,7 +1756,7 @@
+     // The last chance to dump profile before VM terminates
+     if (_state == RUNNING) {
+         args._action = ACTION_STOP;
+-        Error error = run(args);
++        Error error = args._completion != NULL ? expire(args, false) : run(args);
+         if (error) {
+             Log::error("%s", error.message());
+         }
+--- a/src/writer.h
++++ b/src/writer.h
+@@ -45,6 +45,8 @@
+     FileWriter(const char* file_name);
+     FileWriter(int fd);
+     ~FileWriter();
++
++    bool finish();
+ 
+     bool is_open() const {
+         return _fd >= 0;
+--- a/src/writer.cpp
++++ b/src/writer.cpp
+@@ -57,6 +57,14 @@
+     }
+ }
+ 
++bool FileWriter::finish() {
++    flush(_buf, _size);
++    _size = 0;
++    if (_fd >= 0 && close(_fd) != 0) _err = errno;
++    _fd = -1;
++    return good();
++}
++
+ void FileWriter::flush(const char* data, size_t len) {
+     while (len > 0) {
+         ssize_t bytes = ::write(_fd, data, len);
+--- a/src/main/main.cpp
++++ b/src/main/main.cpp
+@@ -524,7 +524,7 @@
+             params << "," << (arg.str() + 2) << "=" << args.next();
+             output = "jfr";
+ 
+-        } else if (arg == "--timeout" || arg == "--loop") {
++        } else if (arg == "--timeout" || arg == "--loop" || arg == "--completion") {
+             params << "," << (arg.str() + 2) << "=" << args.next();
+             if (action == "collect") action = "start";
+ 

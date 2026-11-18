@@ -17,6 +17,7 @@ package registry
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -141,5 +142,34 @@ func TestProfileLogsDataReadingLoopLifecycleOnce(t *testing.T) {
 	}
 	if strings.Index(output, started) > strings.Index(output, ended) {
 		t.Fatalf("data loop lifecycle logs out of order: %s", output)
+	}
+}
+
+// Only opt-in providers receive the acknowledged callback.
+type acknowledgedProfiler struct {
+	fakeProfiler
+	called bool
+}
+
+func (p *acknowledgedProfiler) ReadDataLoop(context.Context, func(any)) error {
+	return fmt.Errorf("legacy loop called")
+}
+
+func (p *acknowledgedProfiler) ReadDataLoopAcknowledged(_ context.Context, enqueue func(any) error) error {
+	p.called = true
+	return enqueue("window")
+}
+
+func TestProfileAcknowledgedDelivery(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	pctx := &pcontext.ProfilerContext{Ctx: ctx, Cancel: cancel, OutputFormat: output.FormatRemote}
+	p := &acknowledgedProfiler{}
+	meta := newMeta(profiling.ImplementationJava, profiling.TypeCPU)
+	meta.Impl = p
+	if err := Profile(pctx, meta); err != nil {
+		t.Fatal(err)
+	}
+	if !p.called {
+		t.Fatal("acknowledged loop not called")
 	}
 }

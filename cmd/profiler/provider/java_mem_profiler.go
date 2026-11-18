@@ -131,3 +131,10 @@ func (p *javaMemoryProfiler) ReadDataLoop(ctx context.Context, enqueue func(any)
 	}
 	return javaruntime.ReadAsprofDataLoop(ctx, p.samplingOpt, p.profileOutFile, enqueue)
 }
+
+func (p *javaMemoryProfiler) ReadDataLoopAcknowledged(ctx context.Context, enqueue func(any) error) error {
+	if p.samplingOpt == nil {
+		return fmt.Errorf("read Java memory profile: profiler is not started")
+	}
+	return javaruntime.ReadAsprofDataLoopAcknowledged(ctx, p.samplingOpt, p.profileOutFile, enqueue)
+}

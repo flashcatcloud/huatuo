@@ -15,91 +15,98 @@
 package java
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
-	"github.com/ccfos/huatuo/internal/log"
 	"github.com/ccfos/huatuo/internal/profiler"
 	profilerexec "github.com/ccfos/huatuo/internal/profiler/exec"
 )
 
 const (
 	asprofFilePollInterval = 100 * time.Millisecond
-	stablePollCount        = 2
+	windowProtocol         = "window-completion-v1"
 )
 
-type fileSignature [2]int64
-
-type observedFile struct {
-	signature fileSignature
-	stable    int
-}
-
 type collapsedFile struct {
-	path      string
-	sequence  uint64
-	signature fileSignature
+	path     string
+	sequence uint64
 }
 
 type collapsedFileCollector struct {
 	pids           []int
 	pidsToFilePath map[int]string
-	enqueueSample  func(profiler.SampleOutput)
-	observedFiles  map[string]observedFile
-	retainedFiles  map[string]fileSignature
+	enqueueSample  func(profiler.SampleOutput) error
+	nextSequence   map[int]uint64
 }
 
-func newCollapsedFileCollector(
-	pids []int,
-	pidsToFilePath map[int]string,
-	enqueueSample func(profiler.SampleOutput),
-) *collapsedFileCollector {
+func newCollapsedFileCollector(pids []int, paths map[int]string, enqueue func(profiler.SampleOutput) error) *collapsedFileCollector {
 	return &collapsedFileCollector{
-		pids:           append([]int(nil), pids...),
-		pidsToFilePath: pidsToFilePath,
-		enqueueSample:  enqueueSample,
-		observedFiles:  make(map[string]observedFile),
-		retainedFiles:  make(map[string]fileSignature),
+		pids: append([]int(nil), pids...), pidsToFilePath: paths,
+		enqueueSample: enqueue, nextSequence: make(map[int]uint64),
 	}
 }
 
 func (c *collapsedFileCollector) run(ctx context.Context) error {
 	ticker := time.NewTicker(asprofFilePollInterval)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ctx.Done():
 			return nil
 		case <-ticker.C:
-			if err := c.scanOutputFiles(false); err != nil {
+			if err := c.scanOutputFiles(); err != nil {
 				return err
+			}
+			complete, err := c.complete()
+			if err != nil {
+				return err
+			}
+			if complete {
+				return nil
 			}
 		}
 	}
 }
 
-func (c *collapsedFileCollector) scanOutputFiles(force bool) error {
+// The agent publishes immutable windows by rename. File size stability cannot
+// distinguish a finished window from a paused writer.
+func (c *collapsedFileCollector) scanOutputFiles() error {
+	var errs []error
 	for _, pid := range c.pids {
 		files, err := c.listSortedFiles(pid)
 		if err != nil {
-			return err
+			errs = append(errs, err)
+			continue
 		}
 		for _, file := range files {
-			if err := c.observeOutputFile(pid, file, force); err != nil {
-				return err
+			if file.sequence < c.nextSequence[pid] {
+				continue
 			}
+			if file.sequence != c.nextSequence[pid] {
+				break
+			}
+			data, err := os.ReadFile(file.path)
+			if err == nil {
+				err = c.enqueueSample(profiler.SampleOutput{PID: pid, Output: string(data)})
+			}
+			if err != nil {
+				errs = append(errs, fmt.Errorf("deliver Java window %q (file retained): %w", file.path, err))
+				break
+			}
+			c.nextSequence[pid]++
+			// Queue acceptance is not durable export. Retain the session files
+			// for recovery if the controller is killed after this point.
 		}
 	}
-
-	return nil
+	return errors.Join(errs...)
 }
 
 func (c *collapsedFileCollector) listSortedFiles(pid int) ([]collapsedFile, error) {
@@ -107,31 +114,49 @@ func (c *collapsedFileCollector) listSortedFiles(pid int) ([]collapsedFile, erro
 	if err != nil {
 		return nil, fmt.Errorf("glob output for pid %d: %w", pid, err)
 	}
-
 	files := make([]collapsedFile, 0, len(paths))
 	for _, path := range paths {
-		sequence, err := collapsedFileSequence(path)
+		seq, err := collapsedFileSequence(path)
 		if err != nil {
 			return nil, err
 		}
-		info, err := os.Stat(path)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, fmt.Errorf("stat output for pid %d: %w", pid, err)
-		}
-		files = append(files, collapsedFile{
-			path:      path,
-			sequence:  sequence,
-			signature: fileSignature{info.Size(), info.ModTime().UnixNano()},
-		})
+		files = append(files, collapsedFile{path: path, sequence: seq})
 	}
-
-	sort.Slice(files, func(i, j int) bool {
-		return files[i].sequence < files[j].sequence
-	})
+	slices.SortFunc(files, func(a, b collapsedFile) int { return cmp.Compare(a.sequence, b.sequence) })
 	return files, nil
+}
+
+func (c *collapsedFileCollector) complete() (bool, error) {
+	all := true
+	for _, pid := range c.pids {
+		path := strings.TrimSuffix(c.pidsToFilePath[pid], "-*.collapsed") + ".complete"
+		data, err := os.ReadFile(path)
+		if errors.Is(err, os.ErrNotExist) {
+			all = false
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("read Java completion %q: %w", path, err)
+		}
+		fields := strings.Split(string(data), "\n")
+		if len(fields) != 3 || fields[0] != windowProtocol || fields[2] != "" {
+			return false, fmt.Errorf("invalid Java completion marker %q", path)
+		}
+		last, err := strconv.ParseUint(fields[1], 10, 64)
+		if err != nil || last == ^uint64(0) {
+			return false, fmt.Errorf("invalid Java final sequence in %q", path)
+		}
+		// The marker may have appeared after the preceding directory scan.
+		if c.nextSequence[pid] < last+1 {
+			if err := c.scanOutputFiles(); err != nil {
+				return false, err
+			}
+		}
+		if c.nextSequence[pid] != last+1 {
+			return false, fmt.Errorf("incomplete Java session for PID %d: delivered %d windows, expected %d; files retained", pid, c.nextSequence[pid], last+1)
+		}
+	}
+	return all, nil
 }
 
 func collapsedFileSequence(path string) (uint64, error) {
@@ -153,79 +178,22 @@ func collapsedFileSequence(path string) (uint64, error) {
 	return sequence, nil
 }
 
-func (c *collapsedFileCollector) observeOutputFile(pid int, file collapsedFile, force bool) error {
-	if retained, ok := c.retainedFiles[file.path]; ok && retained == file.signature {
-		return nil
-	}
-
-	observation := c.observedFiles[file.path]
-	if observation.signature == file.signature {
-		observation.stable++
-	} else {
-		observation = observedFile{signature: file.signature, stable: 1}
-	}
-	c.observedFiles[file.path] = observation
-
-	if !force && observation.stable < stablePollCount {
-		return nil
-	}
-
-	collapsedData, err := os.ReadFile(file.path)
-	if err != nil {
-		return fmt.Errorf("read output for pid %d: %w", pid, err)
-	}
-	removeErr := os.Remove(file.path)
-	if removeErr != nil && !errors.Is(removeErr, os.ErrNotExist) {
-		log.WithError(removeErr).
-			WithField("path", file.path).
-			WithField("pid", pid).
-			Warn("failed to remove consumed async-profiler output")
-		c.retainedFiles[file.path] = file.signature
-	} else {
-		delete(c.retainedFiles, file.path)
-	}
-	delete(c.observedFiles, file.path)
-
-	c.enqueueSample(profiler.SampleOutput{PID: pid, Output: string(collapsedData)})
-	log.WithField("pid", pid).
-		WithField("sequence", file.sequence).
-		WithField("output_bytes", len(collapsedData)).
-		Debug("collected async-profiler output")
-	return nil
-}
-
-func finishAsprofSampling(
-	ctx context.Context,
-	opt *AsprofSamplingOption,
-	collector *collapsedFileCollector,
-) error {
+func finishAsprofSampling(ctx context.Context, opt *AsprofSamplingOption, collector *collapsedFileCollector) error {
 	stopErr := stopAsprofSampling(ctx, opt)
-	if err := collector.scanOutputFiles(true); err != nil {
-		return errors.Join(stopErr, err)
+	scanErr := collector.scanOutputFiles()
+	complete, completeErr := collector.complete()
+	if !complete && completeErr == nil {
+		completeErr = fmt.Errorf("Java completion marker missing; session files retained")
 	}
-	return stopErr
+	return errors.Join(stopErr, scanErr, completeErr)
 }
 
-func stopAsprofSampling(
-	ctx context.Context,
-	opt *AsprofSamplingOption,
-) error {
+func stopAsprofSampling(ctx context.Context, opt *AsprofSamplingOption) error {
 	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), asprofCommandTimeout)
 	defer cancel()
-
-	activePIDs := opt.activePIDList()
-	results := profilerexec.RunAsyncProfiler(finalCtx, activePIDs, asprofPath(opt.ToolPath), func(pid int) []string {
-		return stopWithOutputArgs(pid, opt.SessionID, opt.OutFilePrefix, opt.outputFileCount)
+	results := profilerexec.RunAsyncProfiler(finalCtx, opt.activePIDList(), asprofPath(opt.ToolPath), func(pid int) []string {
+		return finishArgs(pid, opt.SessionID, opt.OutFilePrefix)
 	})
-	finalCtxErr := finalCtx.Err()
 	opt.markStopped(results)
-
-	var timeoutErr error
-	if finalCtxErr != nil {
-		timeoutErr = fmt.Errorf("stop async-profiler after cancellation: %w", finalCtxErr)
-	}
-	return errors.Join(
-		timeoutErr,
-		profilerexec.Verify(results),
-	)
+	return errors.Join(finalCtx.Err(), profilerexec.Verify(results))
 }

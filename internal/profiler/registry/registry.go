@@ -16,6 +16,7 @@ package registry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -93,7 +94,14 @@ func Profile(pctx *pcontext.ProfilerContext, p ProfilerMeta) error {
 	}
 
 	loopDone := make(chan error, 1)
+	acknowledged, confirmsDelivery := p.Impl.(interface {
+		ReadDataLoopAcknowledged(ctx context.Context, enqueue func(any) error) error
+	})
 	go func() {
+		if confirmsDelivery {
+			loopDone <- acknowledged.ReadDataLoopAcknowledged(pctx.Ctx, pipe.EnqueueAcknowledged)
+			return
+		}
 		loopDone <- p.Impl.ReadDataLoop(pctx.Ctx, pipe.Enqueue)
 	}()
 	// Native integration tests use this exact message as the barrier before
@@ -142,9 +150,12 @@ func Profile(pctx *pcontext.ProfilerContext, p ProfilerMeta) error {
 
 	pipe.Stop()
 
-	if err == nil && loopErr != nil {
-		err = loopErr
+	if confirmsDelivery {
+		// A cancellation must not hide a failed final Java window delivery.
+		return errors.Join(err, loopErr)
 	}
-
+	if err == nil {
+		return loopErr
+	}
 	return err
 }

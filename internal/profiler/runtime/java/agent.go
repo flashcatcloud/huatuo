@@ -21,10 +21,12 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/ccfos/huatuo/internal/executil"
 	"github.com/ccfos/huatuo/internal/log"
 	"github.com/ccfos/huatuo/internal/process"
 	"github.com/ccfos/huatuo/internal/profiler"
@@ -71,15 +73,25 @@ func ReadAsprofDataLoop(
 	pidToPath map[int]string,
 	enqueue func(any),
 ) error {
-	collector := newCollapsedFileCollector(
-		opt.Pids,
-		pidToPath,
-		func(output profiler.SampleOutput) { enqueue(output) },
-	)
-	if err := collector.run(ctx); err != nil {
-		return err
+	return ReadAsprofDataLoopAcknowledged(ctx, opt, pidToPath, func(data any) error {
+		enqueue(data)
+		return nil
+	})
+}
+
+// ReadAsprofDataLoopAcknowledged retains windows when delivery is rejected.
+func ReadAsprofDataLoopAcknowledged(
+	ctx context.Context,
+	opt *AsprofSamplingOption,
+	pidToPath map[int]string,
+	enqueue func(any) error,
+) error {
+	if opt.collector == nil {
+		opt.collector = newCollapsedFileCollector(opt.Pids, pidToPath, func(output profiler.SampleOutput) error { return enqueue(output) })
 	}
-	return finishAsprofSampling(ctx, opt, collector)
+	collector := opt.collector
+	loopErr := collector.run(ctx)
+	return errors.Join(loopErr, finishAsprofSampling(ctx, opt, collector))
 }
 
 type AsprofSamplingOption struct {
@@ -97,6 +109,7 @@ type AsprofSamplingOption struct {
 	StartedAt       time.Time
 	activePIDs      map[int]bool
 	outputFileCount uint64
+	collector       *collapsedFileCollector
 }
 
 func asprofPath(toolPath string) string {
@@ -108,11 +121,11 @@ func agentLibraryPath(toolPath string) string {
 }
 
 func StartAsprofSampling(ctx context.Context, opt *AsprofSamplingOption) (map[int]string, error) {
-	if opt.AggrInterval <= 0 {
-		return nil, fmt.Errorf("start async-profiler: aggregation interval must be positive")
+	if opt.AggrInterval < time.Second || opt.AggrInterval%time.Second != 0 {
+		return nil, fmt.Errorf("start async-profiler: aggregation interval must be a positive whole number of seconds")
 	}
-	if opt.Duration <= 0 {
-		return nil, fmt.Errorf("start async-profiler: duration must be positive")
+	if opt.Duration < time.Second || opt.Duration%time.Second != 0 {
+		return nil, fmt.Errorf("start async-profiler: duration must be a positive whole number of seconds")
 	}
 
 	sessionID, err := randomid.New()
@@ -121,6 +134,12 @@ func StartAsprofSampling(ctx context.Context, opt *AsprofSamplingOption) (map[in
 	}
 	opt.SessionID = sessionID
 	opt.activePIDs = make(map[int]bool, len(opt.Pids))
+	opt.collector = nil
+	for _, pid := range opt.Pids {
+		if err := verifyWindowProtocol(ctx, opt, pid); err != nil {
+			return nil, err
+		}
+	}
 	opt.outputFileCount = asprofOutputFileCount(opt.Duration, opt.AggrInterval)
 
 	profileOutFile := make(map[int]string)
@@ -191,6 +210,7 @@ func startAsprofCallback(
 			args,
 			"--timeout", formatAsprofDuration(duration),
 			"--loop", formatAsprofDuration(aggrInterval),
+			"--completion", completionPath(sessionID, outFilePrefix, pid),
 			"-o", "collapsed",
 			"-f", outFile,
 			strconv.Itoa(pid),
@@ -225,24 +245,37 @@ func loopOutputPath(sessionID, outFilePrefix string, pid int, outputFileCount ui
 	)
 }
 
-func finalOutputPath(sessionID, outFilePrefix string, pid int, sequence uint64) string {
-	return fmt.Sprintf(
-		"/tmp/huatuo-asprof-%s-%s-%d-%d.collapsed",
-		sessionID,
-		outFilePrefix,
-		pid,
-		sequence,
-	)
+func completionPath(sessionID, prefix string, pid int) string {
+	return fmt.Sprintf("/tmp/huatuo-asprof-%s-%s-%d.complete", sessionID, prefix, pid)
 }
 
-func stopWithOutputArgs(pid int, sessionID, outFilePrefix string, sequence uint64) []string {
-	return []string{
-		"stop",
-		"--libpath", "/tmp/libasyncProfiler.so",
-		"-o", "collapsed",
-		"-f", finalOutputPath(sessionID, outFilePrefix, pid, sequence),
-		strconv.Itoa(pid),
+func finishArgs(pid int, sessionID, prefix string) []string {
+	return []string{"load", strconv.Itoa(pid), "/tmp/libasyncProfiler.so", "true", "finish,completion=" + completionPath(sessionID, prefix, pid)}
+}
+
+// Query the loaded JVM agent: replacing the .so on disk does not replace an
+// older library already loaded by a long-running JVM.
+func verifyWindowProtocol(ctx context.Context, opt *AsprofSamplingOption, pid int) error {
+	path := completionPath(opt.SessionID, opt.OutFilePrefix, pid) + ".version"
+	hostPath := HostViewPath(pid, path)
+	defer func() { _ = os.Remove(hostPath) }()
+	probeCtx, cancel := context.WithTimeout(ctx, asprofCommandTimeout)
+	defer cancel()
+	_, err := executil.Run(probeCtx, executil.Spec{
+		Path: asprofPath(opt.ToolPath),
+		Args: []string{"load", strconv.Itoa(pid), "/tmp/libasyncProfiler.so", "true", "version,file=" + path},
+	})
+	if err != nil {
+		return fmt.Errorf("query loaded Java agent for PID %d: %w", pid, err)
 	}
+	version, err := os.ReadFile(hostPath)
+	if err != nil {
+		return fmt.Errorf("read loaded Java agent version for PID %d: %w", pid, err)
+	}
+	if !slices.Contains(strings.Fields(string(version)), windowProtocol) {
+		return fmt.Errorf("Java PID %d has an agent without %s; install the bundled patched agent and restart this JVM", pid, windowProtocol)
+	}
+	return nil
 }
 
 func StopJavaProfiler(ctx context.Context, opt *AsprofSamplingOption) error {
@@ -253,21 +286,7 @@ func StopJavaProfiler(ctx context.Context, opt *AsprofSamplingOption) error {
 }
 
 func stopActiveAsprofProcesses(ctx context.Context, opt *AsprofSamplingOption) error {
-	stopCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx),
-		asprofCommandTimeout,
-	)
-	defer cancel()
-
-	activePIDs := opt.activePIDList()
-	results := profilerexec.RunAsyncProfiler(stopCtx, activePIDs, asprofPath(opt.ToolPath), func(pid int) []string {
-		return []string{
-			"stop",
-			"--libpath", "/tmp/libasyncProfiler.so",
-			strconv.Itoa(pid),
-		}
-	})
-	opt.markStopped(results)
+	stopErr := stopAsprofSampling(ctx, opt)
 
 	var cleanupErrs []error
 	for _, pid := range opt.Pids {
@@ -277,7 +296,7 @@ func stopActiveAsprofProcesses(ctx context.Context, opt *AsprofSamplingOption) e
 	}
 
 	return errors.Join(
-		profilerexec.Verify(results),
+		stopErr,
 		errors.Join(cleanupErrs...),
 	)
 }
