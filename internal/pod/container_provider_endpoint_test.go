@@ -48,3 +48,34 @@ func TestRuntimeEndpointOnHost(t *testing.T) {
 		t.Fatalf("tcp endpoint got %q", got)
 	}
 }
+
+func TestContainerInitPIDFallbackFindsK3sStateUnderHostPrefix(t *testing.T) {
+	host := t.TempDir()
+	id := "b12508996e52dfaf2dad08db7329f470bbe8993dbdbcb1be4f69b1b7c5d0bc25"
+	dir := filepath.Join(host, "/run/k3s/containerd/io.containerd.runtime.v2.task/k8s.io", id)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "init.pid"), []byte("4242"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+
+	initMu.Lock()
+	saved := currContainerProvider
+	currContainerProvider = containerProviderNoop
+	initMu.Unlock()
+	t.Cleanup(func() {
+		initMu.Lock()
+		currContainerProvider = saved
+		initMu.Unlock()
+	})
+
+	pid, err := containerInitPIDByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 4242 {
+		t.Fatalf("pid = %d", pid)
+	}
+}
