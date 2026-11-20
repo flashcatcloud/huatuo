@@ -106,29 +106,77 @@ func kubeletPodListHttpRequest(requestCtx context.Context, ctx *ManagerCtx) (*ht
 	return client, err
 }
 
-func kubeletPodListAuthorizationRequest(requestCtx context.Context, ctx *ManagerCtx) (*http.Client, error) {
-	cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
+// serviceAccountTokenPath is where Kubernetes mounts the Pod's projected
+// ServiceAccount token. A variable so tests can point it elsewhere.
+var serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
+
+// kubeletTokenTransport authenticates to the kubelet with the Pod's ServiceAccount
+// token. The token is read on every request because the kubelet rotates the
+// projected file well before it expires.
+type kubeletTokenTransport struct {
+	path string
+	base http.RoundTripper
+}
+
+func (t *kubeletTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	token, err := readServiceAccountToken(t.path)
 	if err != nil {
-		return nil, fmt.Errorf("loading client key pair [%s,%s]: %w",
-			ctx.podClientCertPath, ctx.podClientCertKey, err)
+		return nil, err
 	}
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer "+token)
+	return t.base.RoundTrip(req)
+}
 
-	client := &http.Client{
-		Timeout: kubeletReqTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				Certificates:       []tls.Certificate{cert},
-				InsecureSkipVerify: true, // #nosec G402
-			},
-		},
+func readServiceAccountToken(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read service account token: %w", err)
 	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", fmt.Errorf("service account token %s is empty", path)
+	}
+	return token, nil
+}
 
+// kubeletAuthorizedClient builds the HTTPS kubelet client: a client certificate
+// when one is configured, otherwise the Pod's ServiceAccount token.
+func kubeletAuthorizedClient(ctx *ManagerCtx) (*http.Client, error) {
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true, // #nosec G402 -- kubelet serving certs are commonly self-signed
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	client := &http.Client{Timeout: kubeletReqTimeout, Transport: transport}
+	if ctx.podClientCertPath != "" {
+		cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
+		if err != nil {
+			return nil, fmt.Errorf("loading client key pair [%s,%s]: %w",
+				ctx.podClientCertPath, ctx.podClientCertKey, err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		return client, nil
+	}
+	if _, err := readServiceAccountToken(serviceAccountTokenPath); err != nil {
+		return nil, fmt.Errorf("no client certificate configured and %w", err)
+	}
+	client.Transport = &kubeletTokenTransport{path: serviceAccountTokenPath, base: transport}
+	return client, nil
+}
+
+func kubeletPodListAuthorizationRequest(requestCtx context.Context, ctx *ManagerCtx) (*http.Client, error) {
+	client, err := kubeletAuthorizedClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	_, err = kubeletFetchPodList(requestCtx, client, kubeletPodListAuthorizedURL(ctx.PodAuthorizedPort))
 	return client, err
 }
 
 func kubeletPodListPortCacheUpdate(requestCtx context.Context, ctx *ManagerCtx) error {
-	if client, err := kubeletPodListHttpRequest(requestCtx, ctx); err == nil {
+	if ctx.PodReadOnlyPort == 0 {
+		// The read-only port is disabled; go straight to HTTPS.
+	} else if client, err := kubeletPodListHttpRequest(requestCtx, ctx); err == nil {
 		kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
 		kubeletPodListClient = client
 		kubeletPodListRunningEnabled = true
