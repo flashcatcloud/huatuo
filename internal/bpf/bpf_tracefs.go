@@ -52,13 +52,37 @@ func scanKprobeFunctions(r io.Reader, cache map[string]struct{}) error {
 	return scanner.Err()
 }
 
+// hostPrefixed appends each absolute path again under HOST_MOUNT_PREFIX. A
+// privileged agent container that sees the host root there (/hostfs) usually
+// has its own /sys/kernel/tracing as an empty mountpoint, so the host copy must
+// be tried after the local one rather than only when the local path is absent.
+func hostPrefixed(paths []string) []string {
+	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
+	if prefix == "" {
+		return paths
+	}
+	out := make([]string, 0, 2*len(paths))
+	out = append(out, paths...)
+	for _, p := range paths {
+		if filepath.IsAbs(p) {
+			out = append(out, filepath.Join(prefix, p))
+		}
+	}
+	return out
+}
+
+// TraceFSRoots lists the tracefs roots to probe, local layouts first.
+func TraceFSRoots() []string {
+	return hostPrefixed(traceFSRoots)
+}
+
 // loadKprobeFunctions checks both tracefs layouts because current kernels
 // commonly mount tracefs independently while older systems expose it through
 // debugfs. A failed read is retried on the next lookup.
 func loadKprobeFunctions() {
 	cache := make(map[string]struct{})
 	readOK := false
-	for _, path := range kprobeFunctionFiles {
+	for _, path := range hostPrefixed(kprobeFunctionFiles) {
 		file, err := os.Open(path)
 		if err != nil {
 			continue
@@ -92,7 +116,7 @@ func HasKprobeFunction(name string) bool {
 // TracepointAvailable reports whether tracefs exposes the tracepoint event.
 func TracepointAvailable(group, name string) (bool, error) {
 	var statErrors []error
-	for _, root := range traceFSRoots {
+	for _, root := range TraceFSRoots() {
 		path := filepath.Join(root, "events", group, name, "id")
 		_, err := os.Stat(path)
 		switch {
