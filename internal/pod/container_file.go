@@ -27,10 +27,12 @@ import (
 	"github.com/ccfos/huatuo/internal/pidfile"
 )
 
-const (
-	defaultDockerRootDir      = "/var/lib/docker"
-	defaultContainerdStateDir = "/run/containerd"
-)
+const defaultDockerRootDir = "/var/lib/docker"
+
+// containerdStateDirs are the containerd state roots tried when the runtime was
+// not discovered through the kubelet, as in a standalone profiler process. k3s
+// runs its own containerd under /run/k3s/containerd.
+var containerdStateDirs = []string{"/run/containerd", "/run/k3s/containerd"}
 
 func containerInitPid(containerID string) (int, error) {
 	provider, dockerRoot, containerdState := containerRuntimeState()
@@ -102,19 +104,23 @@ func containerInitPIDByID(containerID string) (int, error) {
 		return containerInitPIDInContainerdState(containerdState, containerID)
 	}
 
-	dockerPID, dockerErr := containerInitPIDInDockerRoot(defaultDockerRootDir, containerID)
-	if dockerErr == nil {
+	dockerPID, err := containerInitPIDInDockerRoot(hostVisiblePath(defaultDockerRootDir), containerID)
+	if err == nil {
 		return dockerPID, nil
 	}
-	containerdPID, containerdErr := containerInitPIDInContainerdState(defaultContainerdStateDir, containerID)
-	if containerdErr == nil {
-		return containerdPID, nil
+	errs := []error{err}
+	for _, stateDir := range containerdStateDirs {
+		containerdPID, err := containerInitPIDInContainerdState(hostVisiblePath(stateDir), containerID)
+		if err == nil {
+			return containerdPID, nil
+		}
+		errs = append(errs, err)
 	}
 
 	return -1, fmt.Errorf(
 		"resolve container %q init PID from local runtime state: %w",
 		containerID,
-		errors.Join(dockerErr, containerdErr),
+		errors.Join(errs...),
 	)
 }
 

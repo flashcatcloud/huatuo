@@ -158,3 +158,27 @@ func resetTraceFSRootsForTest(t *testing.T, roots []string) {
 		traceFSRoots = oldRoots
 	})
 }
+
+func TestTracepointAvailableUnderHostMountPrefix(t *testing.T) {
+	local := t.TempDir()
+	host := t.TempDir()
+	// The container's own tracefs mountpoint exists but is empty.
+	if err := os.MkdirAll(filepath.Join(local, "events"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(host, local, "events", "sched", "sched_switch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, local, "events", "sched", "sched_switch", "id"), []byte("1\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resetTraceFSRootsForTest(t, []string{local})
+
+	if ok, _ := TracepointAvailable("sched", "sched_switch"); ok {
+		t.Fatal("tracepoint must not be found without HOST_MOUNT_PREFIX")
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host+"/")
+	if ok, err := TracepointAvailable("sched", "sched_switch"); !ok || err != nil {
+		t.Fatalf("TracepointAvailable() = %v, %v; want host tracefs", ok, err)
+	}
+}

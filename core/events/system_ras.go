@@ -141,10 +141,8 @@ func newRasTracing() (*tracing.EventTracingAttr, error) {
 // required by the RAS BPF object. Without them, loading or attaching fails on
 // stripped VM kernels.
 func hasRasTracepoint() bool {
-	for _, root := range []string{
-		"/sys/kernel/tracing/events",
-		"/sys/kernel/debug/tracing/events",
-	} {
+	for _, root := range bpf.TraceFSRoots() {
+		root += "/events"
 		if _, err := os.Stat(root + "/ras"); err != nil {
 			continue
 		}

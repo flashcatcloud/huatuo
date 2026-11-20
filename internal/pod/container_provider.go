@@ -18,7 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -94,13 +97,40 @@ func initDockerProviderEnv(apiVersion string) error {
 		return fmt.Errorf("get docker info: %w", err)
 	}
 
-	dockerRootDir = info.DockerRootDir
+	dockerRootDir = hostVisiblePath(info.DockerRootDir)
 	currContainerProvider = containerProviderDocker
 	return nil
 }
 
+// hostVisiblePath maps a host path reported by the kubelet or the container
+// runtime into a container that sees the host root under HOST_MOUNT_PREFIX, as
+// the categraf DaemonSet mounts it at /hostfs. Paths such as k3s's
+// /run/k3s/containerd are not visible at their own location there.
+func hostVisiblePath(p string) string {
+	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
+	if prefix == "" || !filepath.IsAbs(p) {
+		return p
+	}
+	if _, err := os.Stat(p); err == nil {
+		return p
+	}
+	onHost := filepath.Join(prefix, p)
+	if _, err := os.Stat(onHost); err != nil {
+		return p
+	}
+	return onHost
+}
+
+// runtimeEndpointOnHost applies hostVisiblePath to a unix socket endpoint.
+func runtimeEndpointOnHost(endpoint string) string {
+	if socket, ok := strings.CutPrefix(endpoint, "unix://"); ok {
+		return "unix://" + hostVisiblePath(socket)
+	}
+	return endpoint
+}
+
 func initContainerdProviderEnv() error {
-	client, err := k8sremote.NewRemoteRuntimeService(kubeletRuntimeEndpoint, 5*time.Second, nil, nil)
+	client, err := k8sremote.NewRemoteRuntimeService(runtimeEndpointOnHost(kubeletRuntimeEndpoint), 5*time.Second, nil, nil)
 	if err != nil {
 		return fmt.Errorf("create containerd client: %w", err)
 	}
@@ -120,7 +150,7 @@ func initContainerdProviderEnv() error {
 		return fmt.Errorf("unmarshal containerd config: %w", err)
 	}
 
-	containerdStateDir = path.Dir(config.StateDir)
+	containerdStateDir = hostVisiblePath(path.Dir(config.StateDir))
 	currContainerProvider = containerProviderContainerd
 	return nil
 }
