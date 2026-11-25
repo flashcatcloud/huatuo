@@ -15,3 +15,33 @@
 当前验证涵盖 ELF 架构、华佗静态链接、BPF 对象、解包内容一致性及 CLI 启动。真实内核 BPF 挂载、Doris 写入、采样停止清理与 Categraf 准入需要另做运行验收（见 [回归测试清单](flashcat-test-checklist.md)）；制品发布成功不自动放开准入。
 
 原上游 Docker/GitHub Release workflow 保留，Flashcat 仓库禁用其执行以避免同一个 tag 发布到上游镜像名。
+
+## 手动构建复用镜像（Actions 不可用时）
+
+当 GitHub Actions 不可用需要手动在原生 `amd64` / `arm64` 宿主机打包发布时，可直接复用以下预装工具链镜像（包含 Go 1.24、`clang`/`llvm`、`libbpf-dev`、`libelf-dev`、`capnproto`、`mockery@v2.53.6`、`capnpc-go@v3.1.0-alpha.2`、`patch` 及 `/opt/release-venv` 含 `cos-python-sdk-v5`）：
+
+| 架构 | 镜像地址 | Digest | 备注 |
+| --- | --- | --- | --- |
+| `linux/amd64` | `registry.flashcat.cloud/flashcat/huatuo-builder:go1.24-amd64` | `sha256:0a505073916e6af431a3ea0803e8ad464173d549e8d3e2a5d7792b715fdbd347` | 运行时挂载宿主机 `/usr/bin/docker:/usr/local/bin/docker:ro` 与 `/var/run/docker.sock` |
+| `linux/arm64` | `registry.flashcat.cloud/flashcat/huatuo-builder:go1.24-arm64` | `sha256:d5628460b09da4232915356ad04c4aa49404d341e319dd2d28ba5e0acd367e88` | 已内置 `docker` CLI；macOS Docker Desktop 构建需挂载 `/private/tmp:/private/tmp` 并设置 `TMPDIR=/private/tmp` |
+
+手动构建命令示例（在干净源码目录执行）：
+
+```bash
+# amd64（Linux x86_64 宿主机）
+docker run --rm --platform linux/amd64 \
+  -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock \
+  -v /usr/bin/docker:/usr/local/bin/docker:ro \
+  -e GOPROXY=https://goproxy.cn,direct \
+  -w /tmp/huatuo-release/source \
+  registry.flashcat.cloud/flashcat/huatuo-builder:go1.24-amd64 \
+  bash build/release/package.sh <TAG> amd64
+
+# arm64（Apple Silicon macOS Docker Desktop 或 Linux arm64 宿主机）
+docker run --rm --platform linux/arm64 \
+  -v /private/tmp:/private/tmp -v /var/run/docker.sock:/var/run/docker.sock \
+  -e TMPDIR=/private/tmp -e GOPROXY=https://goproxy.cn,direct \
+  -w /private/tmp/huatuo-release/source \
+  registry.flashcat.cloud/flashcat/huatuo-builder:go1.24-arm64 \
+  bash build/release/package.sh <TAG> arm64
+```
