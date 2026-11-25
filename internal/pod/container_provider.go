@@ -105,7 +105,11 @@ func initDockerProviderEnv(apiVersion string) error {
 // resolveUnderHostRoot joins an absolute host path under prefix, re-anchoring
 // absolute symlinks (such as /var/run -> /run on Debian/RHEL) back under prefix
 // instead of letting them escape into the container's own filesystem.
-func resolveUnderHostRoot(prefix, hostPath string) string {
+func resolveUnderHostRoot(prefix, hostPath string) (string, bool) {
+	prefix = cleanHostMountPrefix(prefix)
+	if prefix == "" || !filepath.IsAbs(hostPath) {
+		return "", false
+	}
 	parts := strings.Split(strings.TrimPrefix(filepath.Clean(hostPath), "/"), "/")
 	cur := prefix
 	for hops := 0; len(parts) > 0; {
@@ -117,7 +121,7 @@ func resolveUnderHostRoot(prefix, hostPath string) string {
 		next := filepath.Join(cur, part)
 		fi, err := os.Lstat(next)
 		if err != nil {
-			return filepath.Join(append([]string{next}, parts...)...)
+			return filepath.Join(append([]string{next}, parts...)...), true
 		}
 		if fi.Mode()&os.ModeSymlink == 0 {
 			cur = next
@@ -125,11 +129,11 @@ func resolveUnderHostRoot(prefix, hostPath string) string {
 		}
 		hops++
 		if hops > 16 {
-			return filepath.Join(append([]string{next}, parts...)...)
+			return "", false
 		}
 		target, err := os.Readlink(next)
 		if err != nil {
-			return filepath.Join(append([]string{next}, parts...)...)
+			return "", false
 		}
 		var targetParts []string
 		if filepath.IsAbs(target) {
@@ -142,15 +146,30 @@ func resolveUnderHostRoot(prefix, hostPath string) string {
 		}
 		parts = append(targetParts, parts...)
 	}
-	return cur
+	return cur, true
+}
+
+func cleanHostMountPrefix(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !filepath.IsAbs(raw) {
+		return ""
+	}
+	cleaned := filepath.Clean(raw)
+	if cleaned == "/" {
+		return ""
+	}
+	return cleaned
 }
 
 func hostPathCandidates(p string) []string {
-	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
+	prefix := cleanHostMountPrefix(os.Getenv("HOST_MOUNT_PREFIX"))
 	if prefix == "" || !filepath.IsAbs(p) {
 		return []string{p}
 	}
-	return []string{p, resolveUnderHostRoot(prefix, p)}
+	if resolved, ok := resolveUnderHostRoot(prefix, p); ok {
+		return []string{p, resolved}
+	}
+	return []string{p}
 }
 
 // hostVisiblePath maps a host path into a container mounting the host root at HOST_MOUNT_PREFIX.

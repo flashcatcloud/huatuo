@@ -60,6 +60,9 @@ func PathsForPID(pid int) (*ProcessPaths, error) {
 	filePath := procfs.Path(strconv.Itoa(pid), "cgroup")
 	var reader io.Reader
 	if paths.InPrivateCgroupNS() {
+		if !paths.HasHostCgroupRoot() {
+			return nil, fmt.Errorf("private cgroup namespace requires host cgroupfs mounted at /sys/fs/cgroup or under HOST_MOUNT_PREFIX")
+		}
 		data, err := readInHostCgroupNS(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("read pid %d cgroup in host namespace: %w", pid, err)
@@ -90,19 +93,30 @@ func readInHostCgroupNS(filePath string) ([]byte, error) {
 	}
 	ch := make(chan result, 1)
 	go func() {
-		// Leave the OS thread locked so the Go runtime discards it after setns.
 		runtime.LockOSThread()
+		origNS, origErr := os.Open("/proc/thread-self/ns/cgroup")
+		if origErr == nil {
+			defer origNS.Close()
+		}
 		nsFile, err := os.Open("/proc/1/ns/cgroup")
 		if err != nil {
+			runtime.UnlockOSThread()
 			ch <- result{err: err}
 			return
 		}
 		defer nsFile.Close()
 		if err := unix.Setns(int(nsFile.Fd()), unix.CLONE_NEWCGROUP); err != nil {
+			runtime.UnlockOSThread()
 			ch <- result{err: err}
 			return
 		}
 		data, err := os.ReadFile(filePath)
+		// Restore the original cgroup namespace so the OS thread can be reused;
+		// if restoration is unavailable or fails, leave the thread locked so the
+		// Go runtime discards it cleanly when this goroutine exits.
+		if origErr == nil && unix.Setns(int(origNS.Fd()), unix.CLONE_NEWCGROUP) == nil {
+			runtime.UnlockOSThread()
+		}
 		ch <- result{data: data, err: err}
 	}()
 	res := <-ch

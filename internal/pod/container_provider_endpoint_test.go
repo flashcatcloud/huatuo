@@ -15,6 +15,7 @@
 package pod
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -225,5 +226,36 @@ func TestDockerHostResolvesAbsoluteSymlinkUnderHostPrefix(t *testing.T) {
 	t.Setenv("HOST_MOUNT_PREFIX", host)
 	if got, want := dockerHost(), "unix://"+filepath.Join(host, "run", "docker.sock"); got != want {
 		t.Fatalf("got %q, want %q", got, want)
+	}
+
+	// Relative symlink (/var/run2 -> ../run) with non-canonical HOST_MOUNT_PREFIX ("//" + host + "//").
+	if err := os.Symlink("../run", filepath.Join(host, "var", "run2")); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", "//"+host+"//")
+	if got, want := hostVisiblePath("/var/run2/docker.sock"), filepath.Join(host, "run", "docker.sock"); got != want {
+		t.Fatalf("relative symlink under messy prefix got %q, want %q", got, want)
+	}
+
+	// Symlink chain exceeding 16 hops must not return an unresolved symlink that escapes host.
+	outside := t.TempDir()
+	escapeTarget := filepath.Join(outside, "escaped.sock")
+	if err := os.WriteFile(escapeTarget, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(host, "deep"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(escapeTarget, filepath.Join(host, "deep", "hop17")); err != nil {
+		t.Fatal(err)
+	}
+	for i := 16; i >= 0; i-- {
+		if err := os.Symlink(fmt.Sprintf("hop%d", i+1), filepath.Join(host, "deep", fmt.Sprintf("hop%d", i))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+	if got := hostVisiblePath("/deep/hop0"); got != "/deep/hop0" {
+		t.Fatalf("excessive symlink chain resolved to %q, want original unprefixed path without escaping", got)
 	}
 }

@@ -843,3 +843,118 @@ func TestKubeletTokenClientVerifiesCAAndNodeSANWhenCAPathConfigured(t *testing.T
 		}
 	})
 }
+
+func TestReadOnlyPortFailureWithoutAuthorizedPortSkipsHTTPS(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+
+	err = kubeletPodListPortCacheUpdate(context.Background(), &ManagerCtx{PodReadOnlyPort: port})
+	if err == nil {
+		t.Fatal("expected the read-only port error")
+	}
+	if !strings.HasPrefix(err.Error(), "podlist http:") || strings.Contains(err.Error(), "https://") {
+		t.Fatalf("err = %v, want the read-only port error without an HTTPS attempt", err)
+	}
+}
+
+func TestKubeletConfigCacheAfterReadOnlyPodList(t *testing.T) {
+	oldClient, oldURL, oldEnabled := kubeletPodListClient, kubeletPodListURL, kubeletPodListRunningEnabled
+	oldDriver, oldEndpoint, oldPaths := kubeletPodCgroupDriver, kubeletRuntimeEndpoint, kubeletDefaultConfigPath
+	t.Cleanup(func() {
+		kubeletPodListClient = oldClient
+		kubeletPodListURL = oldURL
+		kubeletPodListRunningEnabled = oldEnabled
+		kubeletPodCgroupDriver = oldDriver
+		kubeletRuntimeEndpoint = oldEndpoint
+		kubeletDefaultConfigPath = oldPaths
+	})
+
+	roSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/pods" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer roSrv.Close()
+	roPort := uint32(roSrv.Listener.Addr().(*net.TCPAddr).Port)
+
+	var configzAuthHeader string
+	authSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/configz" {
+			http.NotFound(w, r)
+			return
+		}
+		configzAuthHeader = r.Header.Get("Authorization")
+		if configzAuthHeader != "Bearer ro-fallback-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"kubeletconfig":{"cgroupDriver":"systemd","containerRuntimeEndpoint":"unix:///run/k3s/containerd/containerd.sock"}}`))
+	}))
+	defer authSrv.Close()
+	authPort := uint32(authSrv.Listener.Addr().(*net.TCPAddr).Port)
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("ro-fallback-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldTok := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = oldTok })
+
+	caPath := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: authSrv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Read-only /pods succeeds, and PodAuthorizedPort=0 skips HTTPS /configz cleanly.
+	cfgFile := filepath.Join(dir, "kubelet-config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("cgroupDriver: cgroupfs\ncontainerRuntimeEndpoint: unix:///run/containerd/containerd.sock\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kubeletDefaultConfigPath = []string{cfgFile}
+	ctxNoAuthPort := &ManagerCtx{PodReadOnlyPort: roPort, PodAuthorizedPort: 0}
+	if err := kubeletPodListPortCacheUpdate(context.Background(), ctxNoAuthPort); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeletConfigCacheMustUpdate(ctxNoAuthPort); err != nil {
+		t.Fatal(err)
+	}
+	if configzAuthHeader != "" {
+		t.Fatalf("PodAuthorizedPort=0 unexpectedly contacted HTTPS /configz")
+	}
+
+	// 2. Read-only /pods succeeds (caching plain HTTP client), and no local config file exists:
+	// kubeletConfigCacheMustUpdate must build an authorized HTTPS client instead of reusing the plain HTTP client.
+	kubeletDefaultConfigPath = []string{filepath.Join(dir, "nonexistent.yaml")}
+	ctxBothPorts := &ManagerCtx{PodReadOnlyPort: roPort, PodAuthorizedPort: authPort, PodCAPath: caPath}
+	if err := kubeletPodListPortCacheUpdate(context.Background(), ctxBothPorts); err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(kubeletPodListURL, "https://") {
+		t.Fatalf("kubeletPodListURL = %q, want http:// read-only endpoint", kubeletPodListURL)
+	}
+	if err := kubeletConfigCacheMustUpdate(ctxBothPorts); err != nil {
+		t.Fatal(err)
+	}
+	if configzAuthHeader != "Bearer ro-fallback-token" {
+		t.Fatalf("configzAuthHeader = %q, want Bearer ro-fallback-token", configzAuthHeader)
+	}
+	if kubeletRuntimeEndpoint != "unix:///run/k3s/containerd/containerd.sock" {
+		t.Fatalf("kubeletRuntimeEndpoint = %q, want k3s endpoint", kubeletRuntimeEndpoint)
+	}
+}

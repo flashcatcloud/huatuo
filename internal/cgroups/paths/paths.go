@@ -34,25 +34,82 @@ var (
 		hostNS, err := os.Readlink("/proc/1/ns/cgroup")
 		return err == nil && selfNS != hostNS
 	})
+
+	localRootMatchesHost = sync.OnceValue(func() bool {
+		return sameFileByPath(defaultCgroupRoot, "/proc/1/root"+defaultCgroupRoot)
+	})
+
+	hostRootMu     sync.Mutex
+	cachedPrefix   string
+	cachedHostRoot string
+	cachedChecked  bool
 )
+
+func sameFileByPath(a, b string) bool {
+	fiA, err := os.Stat(a)
+	if err != nil {
+		return false
+	}
+	fiB, err := os.Stat(b)
+	if err != nil {
+		return false
+	}
+	return os.SameFile(fiA, fiB)
+}
 
 // InPrivateCgroupNS reports whether this process runs in a non-root cgroup namespace.
 func InPrivateCgroupNS() bool {
 	return inPrivateCgroupNS()
 }
 
+func resolveHostCgroupRoot(rawPrefix string) string {
+	rawPrefix = strings.TrimSpace(rawPrefix)
+	if rawPrefix == "" || !filepath.IsAbs(rawPrefix) {
+		return ""
+	}
+	prefix := filepath.Clean(rawPrefix)
+	if prefix == "/" {
+		return ""
+	}
+	hostRootMu.Lock()
+	defer hostRootMu.Unlock()
+	if cachedChecked && cachedPrefix == prefix {
+		return cachedHostRoot
+	}
+	candidate := filepath.Join(prefix, defaultCgroupRoot)
+	resolved := ""
+	if _, err := os.Stat(candidate); err == nil {
+		resolved = candidate
+	}
+	cachedPrefix = prefix
+	cachedHostRoot = resolved
+	cachedChecked = true
+	return resolved
+}
+
+// HasHostCgroupRoot reports whether host-namespace cgroup paths can be resolved
+// on the filesystem (either via HOST_MOUNT_PREFIX or a direct host /sys bind mount).
+func HasHostCgroupRoot() bool {
+	return hasHostCgroupRoot(RootfsDefaultPath, InPrivateCgroupNS(), os.Getenv("HOST_MOUNT_PREFIX"), localRootMatchesHost)
+}
+
+func hasHostCgroupRoot(rootfs string, privateNS bool, rawPrefix string, localMatchesHost func() bool) bool {
+	if rootfs != defaultCgroupRoot || !privateNS {
+		return true
+	}
+	if resolveHostCgroupRoot(rawPrefix) != "" {
+		return true
+	}
+	return localMatchesHost()
+}
+
 // Root returns the host cgroupfs root, falling back to HOST_MOUNT_PREFIX when
 // running inside a private cgroup namespace.
 func Root() string {
-	if RootfsDefaultPath != defaultCgroupRoot {
+	if RootfsDefaultPath != defaultCgroupRoot || !InPrivateCgroupNS() {
 		return RootfsDefaultPath
 	}
-	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
-	if prefix == "" || !InPrivateCgroupNS() {
-		return RootfsDefaultPath
-	}
-	hostRoot := filepath.Join(prefix, RootfsDefaultPath)
-	if _, err := os.Stat(hostRoot); err == nil {
+	if hostRoot := resolveHostCgroupRoot(os.Getenv("HOST_MOUNT_PREFIX")); hostRoot != "" {
 		return hostRoot
 	}
 	return RootfsDefaultPath

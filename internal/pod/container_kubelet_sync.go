@@ -594,18 +594,34 @@ func kubeletConfigCacheMustUpdate(ctx *ManagerCtx) error {
 			kubeletPodCgroupDriver, kubeletRuntimeEndpoint)
 	}()
 
-	config, err = kubeletConfigDoRequest(
-		kubeletPodListClient,
-		kubeletConfigAuthorizedURL(kubeletHost(ctx), ctx.PodAuthorizedPort),
-	)
-	if err == nil {
-		return nil
+	var configzErr error
+	if ctx != nil && ctx.PodAuthorizedPort != 0 {
+		client := kubeletPodListClient
+		if client == nil || !strings.HasPrefix(kubeletPodListURL, "https://") {
+			client, configzErr = kubeletAuthorizedClient(ctx)
+		}
+		if configzErr == nil {
+			config, configzErr = kubeletConfigDoRequest(
+				client,
+				kubeletConfigAuthorizedURL(kubeletHost(ctx), ctx.PodAuthorizedPort),
+			)
+			if configzErr == nil {
+				return nil
+			}
+		}
 	}
 
-	log.Debugf("kubelet config port is not available, try to read config files: %v", kubeletDefaultConfigPath)
+	log.Debugf("kubelet config port is not available (%v), try to read config files: %v", configzErr, kubeletDefaultConfigPath)
 
 	config, err = kubeletConfigFileDefault()
 	if err != nil {
+		if configzErr != nil {
+			panic(fmt.Sprintf(
+				"we cannot find any cgroup driver of kubelet after requesting configz (%v) and default files: %v",
+				configzErr,
+				err,
+			))
+		}
 		panic(fmt.Sprintf(
 			"we cannot find any cgroup driver of kubelet after requesting configz and default files: %v",
 			err,

@@ -15,6 +15,7 @@
 package paths
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 )
@@ -69,5 +70,57 @@ func TestRootfsDefaultPath(t *testing.T) {
 	const wantCgroupV2Root = "/sys/fs/cgroup"
 	if RootfsDefaultPath != wantCgroupV2Root {
 		t.Errorf("RootfsDefaultPath: got %q, want %q", RootfsDefaultPath, wantCgroupV2Root)
+	}
+}
+
+func TestResolveHostCgroupRootCachesAndNormalizesPrefix(t *testing.T) {
+	t.Cleanup(func() {
+		hostRootMu.Lock()
+		cachedPrefix = ""
+		cachedHostRoot = ""
+		cachedChecked = false
+		hostRootMu.Unlock()
+	})
+	host := t.TempDir()
+	want := filepath.Join(host, "sys", "fs", "cgroup")
+	if err := os.MkdirAll(want, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveHostCgroupRoot("//" + host + "//"); got != want {
+		t.Fatalf("resolveHostCgroupRoot(messy host) = %q, want %q", got, want)
+	}
+	// Second call hits the cache for the same cleaned prefix.
+	if got := resolveHostCgroupRoot(host); got != want {
+		t.Fatalf("resolveHostCgroupRoot(cached host) = %q, want %q", got, want)
+	}
+	// Switching to a prefix without /sys/fs/cgroup invalidates the cached prefix.
+	emptyHost := t.TempDir()
+	if got := resolveHostCgroupRoot(emptyHost); got != "" {
+		t.Fatalf("resolveHostCgroupRoot(emptyHost) = %q, want empty", got)
+	}
+	for _, invalid := range []string{"", "/", "relative/prefix"} {
+		if got := resolveHostCgroupRoot(invalid); got != "" {
+			t.Fatalf("resolveHostCgroupRoot(%q) = %q, want empty", invalid, got)
+		}
+	}
+
+	// Verify private-cgroupns host root eligibility across all 3 deployment modes:
+	// (a) HOST_MOUNT_PREFIX mounted; (b) direct host /sys bind mount (SameFile); (c) isolated private cgroupfs.
+	if !hasHostCgroupRoot(defaultCgroupRoot, true, host, func() bool { return false }) {
+		t.Fatal("expected true when HOST_MOUNT_PREFIX contains /sys/fs/cgroup")
+	}
+	if !hasHostCgroupRoot(defaultCgroupRoot, true, "", func() bool { return true }) {
+		t.Fatal("expected true when /sys/fs/cgroup matches /proc/1/root/sys/fs/cgroup without HOST_MOUNT_PREFIX")
+	}
+	if hasHostCgroupRoot(defaultCgroupRoot, true, "", func() bool { return false }) {
+		t.Fatal("expected false when in private cgroupns without HOST_MOUNT_PREFIX or host /sys bind mount")
+	}
+	sameDir := t.TempDir()
+	otherDir := t.TempDir()
+	if !sameFileByPath(sameDir, sameDir) {
+		t.Fatal("sameFileByPath on identical directory returned false")
+	}
+	if sameFileByPath(sameDir, otherDir) {
+		t.Fatal("sameFileByPath on distinct directories returned true")
 	}
 }
