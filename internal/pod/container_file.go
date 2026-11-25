@@ -35,12 +35,28 @@ func containerInitPid(containerID string) (int, error) {
 	provider, dockerRoot, containerdState := containerRuntimeState()
 	switch provider {
 	case containerProviderDocker:
-		return containerInitPIDInDockerRoot(dockerRoot, containerID)
+		return firstInitPID([]string{dockerRoot}, containerID, containerInitPIDInDockerRoot)
 	case containerProviderContainerd:
-		return containerInitPIDInContainerdState(containerdState, containerID)
+		return firstInitPID([]string{containerdState}, containerID, containerInitPIDInContainerdState)
 	default:
 		return -1, fmt.Errorf("container provider not initialized")
 	}
+}
+
+// firstInitPID tries each dir locally, then under HOST_MOUNT_PREFIX, because an
+// empty local mountpoint can shadow the host's runtime state.
+func firstInitPID(dirs []string, containerID string, lookup func(dir, containerID string) (int, error)) (int, error) {
+	var errs []error
+	for _, dir := range dirs {
+		for _, candidate := range hostPathCandidates(dir) {
+			pid, err := lookup(candidate, containerID)
+			if err == nil {
+				return pid, nil
+			}
+			errs = append(errs, err)
+		}
+	}
+	return -1, errors.Join(errs...)
 }
 
 func containerInitPIDInDockerRoot(rootDir, containerID string) (int, error) {
@@ -96,33 +112,24 @@ func containerInitPIDByID(containerID string) (int, error) {
 	provider, dockerRoot, containerdState := containerRuntimeState()
 	switch provider {
 	case containerProviderDocker:
-		return containerInitPIDInDockerRoot(dockerRoot, containerID)
+		return firstInitPID([]string{dockerRoot}, containerID, containerInitPIDInDockerRoot)
 	case containerProviderContainerd:
-		return containerInitPIDInContainerdState(containerdState, containerID)
+		return firstInitPID([]string{containerdState}, containerID, containerInitPIDInContainerdState)
 	}
 
-	var errs []error
-	for _, dockerRoot := range hostPathCandidates(defaultDockerRootDir) {
-		dockerPID, err := containerInitPIDInDockerRoot(dockerRoot, containerID)
-		if err == nil {
-			return dockerPID, nil
-		}
-		errs = append(errs, err)
+	dockerPID, dockerErr := firstInitPID([]string{defaultDockerRootDir}, containerID, containerInitPIDInDockerRoot)
+	if dockerErr == nil {
+		return dockerPID, nil
 	}
-	for _, stateDir := range containerdStateDirs {
-		for _, candidate := range hostPathCandidates(stateDir) {
-			containerdPID, err := containerInitPIDInContainerdState(candidate, containerID)
-			if err == nil {
-				return containerdPID, nil
-			}
-			errs = append(errs, err)
-		}
+	containerdPID, containerdErr := firstInitPID(containerdStateDirs, containerID, containerInitPIDInContainerdState)
+	if containerdErr == nil {
+		return containerdPID, nil
 	}
 
 	return -1, fmt.Errorf(
 		"resolve container %q init PID from local runtime state: %w",
 		containerID,
-		errors.Join(errs...),
+		errors.Join(dockerErr, containerdErr),
 	)
 }
 

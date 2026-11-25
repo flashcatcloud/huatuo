@@ -97,7 +97,7 @@ func initDockerProviderEnv(apiVersion string) error {
 		return fmt.Errorf("get docker info: %w", err)
 	}
 
-	dockerRootDir = hostVisiblePath(info.DockerRootDir)
+	dockerRootDir = info.DockerRootDir
 	currContainerProvider = containerProviderDocker
 	return nil
 }
@@ -149,7 +149,7 @@ func initContainerdProviderEnv() error {
 		return fmt.Errorf("unmarshal containerd config: %w", err)
 	}
 
-	containerdStateDir = hostVisiblePath(path.Dir(config.StateDir))
+	containerdStateDir = path.Dir(config.StateDir)
 	currContainerProvider = containerProviderContainerd
 	return nil
 }

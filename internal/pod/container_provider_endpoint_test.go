@@ -115,3 +115,64 @@ func TestContainerInitPIDFallbackSkipsEmptyLocalStateDir(t *testing.T) {
 		t.Fatalf("pid = %d, want 5353", pid)
 	}
 }
+
+func TestContainerInitPIDInitializedProviderSkipsEmptyLocalStateDir(t *testing.T) {
+	localState := t.TempDir()
+	host := t.TempDir()
+	id := "b12508996e52dfaf2dad08db7329f470bbe8993dbdbcb1be4f69b1b7c5d0bc25"
+	hostTaskDir := filepath.Join(host, localState, "io.containerd.runtime.v2.task", "k8s.io", id)
+	if err := os.MkdirAll(hostTaskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostTaskDir, "init.pid"), []byte("6464"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+
+	initMu.Lock()
+	savedProvider, savedState := currContainerProvider, containerdStateDir
+	currContainerProvider, containerdStateDir = containerProviderContainerd, localState
+	initMu.Unlock()
+	t.Cleanup(func() {
+		initMu.Lock()
+		currContainerProvider, containerdStateDir = savedProvider, savedState
+		initMu.Unlock()
+	})
+
+	for name, resolve := range map[string]func(string) (int, error){"containerInitPid": containerInitPid, "containerInitPIDByID": containerInitPIDByID} {
+		pid, err := resolve(id)
+		if err != nil {
+			t.Fatalf("%s: %v", name, err)
+		}
+		if pid != 6464 {
+			t.Fatalf("%s: pid = %d, want 6464", name, pid)
+		}
+	}
+}
+
+func TestKubeletConfigFileDefaultReadsUnderHostMountPrefix(t *testing.T) {
+	host := t.TempDir()
+	local := filepath.Join(t.TempDir(), "kubelet", "config.yaml")
+	if err := os.MkdirAll(filepath.Join(host, filepath.Dir(local)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, local), []byte("cgroupDriver: systemd\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := kubeletDefaultConfigPath
+	kubeletDefaultConfigPath = []string{local}
+	t.Cleanup(func() { kubeletDefaultConfigPath = old })
+
+	t.Setenv("HOST_MOUNT_PREFIX", "")
+	if _, err := kubeletConfigFileDefault(); err == nil {
+		t.Fatal("found a config that only exists under the host prefix")
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+	config, err := kubeletConfigFileDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.CgroupDriver != "systemd" {
+		t.Fatalf("cgroupDriver = %q, want systemd", config.CgroupDriver)
+	}
+}

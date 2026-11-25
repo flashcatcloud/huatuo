@@ -170,13 +170,17 @@ func kubeletPodListAuthorizationRequest(requestCtx context.Context, ctx *Manager
 }
 
 func kubeletPodListPortCacheUpdate(requestCtx context.Context, ctx *ManagerCtx) error {
-	if ctx.PodReadOnlyPort == 0 {
-		// The read-only port is disabled; go straight to HTTPS.
-	} else if client, err := kubeletPodListHttpRequest(requestCtx, ctx); err == nil {
-		kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
-		kubeletPodListClient = client
-		kubeletPodListRunningEnabled = true
-		return nil
+	if ctx.PodReadOnlyPort != 0 {
+		client, err := kubeletPodListHttpRequest(requestCtx, ctx)
+		if err == nil {
+			kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
+			kubeletPodListClient = client
+			kubeletPodListRunningEnabled = true
+			return nil
+		}
+		if ctx.PodAuthorizedPort == 0 {
+			return fmt.Errorf("podlist http: %w", err)
+		}
 	}
 
 	// try to fallback https.
@@ -452,18 +456,20 @@ func parseContainerIPAddress(pod *corev1.Pod) string {
 func kubeletConfigFileDefault() (kubeletConfiguration, error) {
 	empty := kubeletConfiguration{}
 
-	for _, name := range kubeletDefaultConfigPath {
-		data, err := os.ReadFile(name)
-		if err != nil {
-			continue
-		}
+	for _, configPath := range kubeletDefaultConfigPath {
+		for _, name := range hostPathCandidates(configPath) {
+			data, err := os.ReadFile(name)
+			if err != nil {
+				continue
+			}
 
-		config := kubeletConfiguration{}
-		if err := yaml.Unmarshal(data, &config); err != nil {
-			continue
-		}
+			config := kubeletConfiguration{}
+			if err := yaml.Unmarshal(data, &config); err != nil {
+				continue
+			}
 
-		return config, nil
+			return config, nil
+		}
 	}
 
 	return empty, fmt.Errorf("not found kubelet config")
