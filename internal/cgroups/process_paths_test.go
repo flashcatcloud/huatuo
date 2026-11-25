@@ -50,6 +50,16 @@ func TestParseProcessPaths(t *testing.T) {
 			name:     "empty membership",
 			hasError: true,
 		},
+		{
+			name:     "escaped namespace root",
+			content:  "0::/../..\n",
+			hasError: true,
+		},
+		{
+			name:     "escaped namespace sibling",
+			content:  "0::/../../kubepods.slice/pod.slice\n",
+			hasError: true,
+		},
 	}
 
 	for _, tt := range tests {

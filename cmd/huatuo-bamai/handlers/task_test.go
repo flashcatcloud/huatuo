@@ -16,6 +16,8 @@ package handlers
 
 import (
 	"testing"
+
+	"github.com/ccfos/huatuo/pkg/observation"
 )
 
 func TestHostCPURequest(t *testing.T) {
@@ -69,5 +71,48 @@ func TestParseHostNativeModes(t *testing.T) {
 		if err != nil || req.HostPID != 42 || string(req.Spec.Mode) != tc.mode || string(req.OffCPUPhase) != tc.phase {
 			t.Fatalf("%v: request=%+v err=%v", tc.flags, req, err)
 		}
+	}
+}
+
+func TestContainerTaskRequest(t *testing.T) {
+	const cid = "b12508996e52dfaf2dad08db7329f470bbe8993dbdbcb1be4f69b1b7c5d0bc25"
+	exe := "/opt/huatuo/bin/huatuo-bamai"
+	for _, lang := range []string{"java", "python", "go", "c++"} {
+		args := []string{"-t", "cpu", "-l", lang, "--container-id", cid}
+		window := "10"
+		if lang == "java" || lang == "python" {
+			args = append(args, "--tool-path", "/opt/huatuo")
+		} else {
+			args = append(args, "--thread-group")
+		}
+		if lang == "python" {
+			window = "30"
+		}
+		args = append(args, "--tracer-id", "cp-1", "--duration", "30", "--aggr-interval", window, "--max-concurrent-procs", "10", "--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock")
+		req := NewTaskReq{RequestID: "cp-1", TracerName: "profiler", Timeout: 50, DataType: "db-json", TracerArgs: args}
+		got, err := parseHostTask(&req, exe)
+		if err != nil {
+			t.Fatalf("%s: %v", lang, err)
+		}
+		if got.Scope != observation.ScopeContainer || got.ContainerID != cid || got.HostPID != 0 {
+			t.Fatalf("%s: got scope=%q container=%q pid=%d", lang, got.Scope, got.ContainerID, got.HostPID)
+		}
+	}
+
+	bad := NewTaskReq{RequestID: "cp-1", TracerName: "profiler", Timeout: 50, DataType: "db-json", TracerArgs: []string{"-t", "cpu", "-l", "go", "--container-id", "", "--thread-group", "--tracer-id", "cp-1", "--duration", "30", "--aggr-interval", "10", "--max-concurrent-procs", "10", "--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock"}}
+	if _, err := parseHostTask(&bad, exe); err == nil {
+		t.Fatal("accepted an empty container id")
+	}
+}
+
+func TestHostPIDRequestKeepsHostScope(t *testing.T) {
+	args := []string{"-t", "cpu", "-l", "go", "--pid", "42", "--thread-group", "--tracer-id", "cp-1", "--duration", "30", "--aggr-interval", "10", "--max-concurrent-procs", "10", "--output-format", "remote", "--output-storage", "/var/run/huatuo-toolstream.sock"}
+	req := NewTaskReq{RequestID: "cp-1", TracerName: "profiler", Timeout: 50, DataType: "db-json", TracerArgs: args}
+	got, err := parseHostTask(&req, "/opt/huatuo/bin/huatuo-bamai")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Scope != observation.ScopeHost || got.HostPID != 42 || got.ContainerID != "" {
+		t.Fatalf("got %+v", got)
 	}
 }

@@ -17,12 +17,15 @@ package pod
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
+	"net"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -35,6 +38,7 @@ import (
 )
 
 const (
+	defaultKubeletHost                      = "127.0.0.1"
 	kubeletReqTimeout                       = 5 * time.Second
 	kubeletOversizedResponseWarningInterval = 30 * time.Minute
 	maxKubeletResponseBodyBytes             = 128 << 20
@@ -75,9 +79,11 @@ type kubeletConfigz struct {
 }
 
 type ManagerCtx struct {
+	PodHost           string
 	PodReadOnlyPort   uint32
 	PodAuthorizedPort uint32
 	PodClientCertPath string
+	PodCAPath         string
 	DockerAPIVersion  string
 
 	// this is used internally.
@@ -85,16 +91,62 @@ type ManagerCtx struct {
 	podClientCertKey  string
 }
 
+func kubeletHost(ctx *ManagerCtx) string {
+	if ctx != nil {
+		if host := strings.TrimSpace(ctx.PodHost); host != "" {
+			return host
+		}
+	}
+	return defaultKubeletHost
+}
+
+func isLoopbackKubeletHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return strings.EqualFold(host, "localhost")
+}
+
+// ValidateKubeletHost verifies that host is empty, a literal IP address, or a
+// valid DNS hostname without scheme, port, or path components.
+func ValidateKubeletHost(host string) error {
+	host = strings.TrimSpace(host)
+	if host == "" || net.ParseIP(host) != nil {
+		return nil
+	}
+	trimmed := strings.TrimSuffix(host, ".")
+	if trimmed == "" || len(trimmed) > 253 {
+		return fmt.Errorf("invalid kubelet host %q", host)
+	}
+	for _, label := range strings.Split(trimmed, ".") {
+		if label == "" || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return fmt.Errorf("invalid kubelet host %q", host)
+		}
+		for i := range len(label) {
+			c := label[i]
+			if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '-' {
+				continue
+			}
+			return fmt.Errorf("invalid kubelet host %q", host)
+		}
+	}
+	return nil
+}
+
+func kubeletEndpoint(host string, port uint32) string {
+	return net.JoinHostPort(host, strconv.FormatUint(uint64(port), 10))
+}
+
 func kubeletPodListReadOnlyURL(port uint32) string {
 	return fmt.Sprintf("http://127.0.0.1:%d/pods", port)
 }
 
-func kubeletPodListAuthorizedURL(port uint32) string {
-	return fmt.Sprintf("https://127.0.0.1:%d/pods", port)
+func kubeletPodListAuthorizedURL(host string, port uint32) string {
+	return fmt.Sprintf("https://%s/pods", kubeletEndpoint(host, port))
 }
 
-func kubeletConfigAuthorizedURL(port uint32) string {
-	return fmt.Sprintf("https://127.0.0.1:%d/configz", port)
+func kubeletConfigAuthorizedURL(host string, port uint32) string {
+	return fmt.Sprintf("https://%s/configz", kubeletEndpoint(host, port))
 }
 
 func kubeletPodListHttpRequest(requestCtx context.Context, ctx *ManagerCtx) (*http.Client, error) {
@@ -106,33 +158,121 @@ func kubeletPodListHttpRequest(requestCtx context.Context, ctx *ManagerCtx) (*ht
 	return client, err
 }
 
-func kubeletPodListAuthorizationRequest(requestCtx context.Context, ctx *ManagerCtx) (*http.Client, error) {
-	cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
-	if err != nil {
-		return nil, fmt.Errorf("loading client key pair [%s,%s]: %w",
-			ctx.podClientCertPath, ctx.podClientCertKey, err)
-	}
+// #nosec G101 -- well-known Kubernetes ServiceAccount token mount path
+var serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
+// kubeletTokenTransport re-reads the rotated ServiceAccount token on each request.
+type kubeletTokenTransport struct {
+	path string
+	base http.RoundTripper
+}
+
+func (t *kubeletTokenTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	token, err := readServiceAccountToken(t.path)
+	if err != nil {
+		return nil, err
+	}
+	req = req.Clone(req.Context())
+	req.Header.Set("Authorization", "Bearer "+token)
+	return t.base.RoundTrip(req)
+}
+
+func readServiceAccountToken(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read service account token: %w", err)
+	}
+	token := strings.TrimSpace(string(raw))
+	if token == "" {
+		return "", fmt.Errorf("service account token %s is empty", path)
+	}
+	return token, nil
+}
+
+func loadKubeletCAPool(path string) (*x509.CertPool, error) {
+	pemData, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read kubelet CA certificate: %w", err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(pemData) {
+		return nil, fmt.Errorf("parse kubelet CA certificate %s: no valid PEM certificates", path)
+	}
+	return pool, nil
+}
+
+// kubeletAuthorizedClient builds the HTTPS kubelet client: a client certificate
+// when one is configured, otherwise the Pod's ServiceAccount token. When
+// PodCAPath is set, the kubelet serving certificate is strictly verified against
+// that CA bundle for both authentication modes; when empty, loopback connections
+// preserve compatibility with self-signed kubelet serving certificates, while
+// non-loopback hosts in token mode require PodCAPath.
+func kubeletAuthorizedClient(ctx *ManagerCtx) (*http.Client, error) {
 	client := &http.Client{
 		Timeout: kubeletReqTimeout,
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{
-				Certificates:       []tls.Certificate{cert},
-				InsecureSkipVerify: true, // #nosec G402
-			},
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
+	var caPool *x509.CertPool
+	if caPath := strings.TrimSpace(ctx.PodCAPath); caPath != "" {
+		var err error
+		caPool, err = loadKubeletCAPool(caPath)
+		if err != nil {
+			return nil, err
+		}
+	}
+	tlsConfig := &tls.Config{
+		MinVersion: tls.VersionTLS12,
+	}
+	if caPool != nil {
+		tlsConfig.RootCAs = caPool
+	} else {
+		tlsConfig.InsecureSkipVerify = true // #nosec G402 -- default preserves compatibility with self-signed kubelet certs when PodCAPath is unset
+	}
+	if ctx.podClientCertPath != "" {
+		cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
+		if err != nil {
+			return nil, fmt.Errorf("loading client key pair [%s,%s]: %w",
+				ctx.podClientCertPath, ctx.podClientCertKey, err)
+		}
+		tlsConfig.Certificates = []tls.Certificate{cert}
+		client.Transport = &http.Transport{TLSClientConfig: tlsConfig}
+		return client, nil
+	}
+	if caPool == nil && !isLoopbackKubeletHost(kubeletHost(ctx)) {
+		return nil, fmt.Errorf("non-loopback kubelet host %q requires KubeletCAPath in service account token mode", kubeletHost(ctx))
+	}
+	if _, err := readServiceAccountToken(serviceAccountTokenPath); err != nil {
+		return nil, fmt.Errorf("no client certificate configured and %w", err)
+	}
+	transport := &http.Transport{TLSClientConfig: tlsConfig}
+	client.Transport = &kubeletTokenTransport{path: serviceAccountTokenPath, base: transport}
+	return client, nil
+}
 
-	_, err = kubeletFetchPodList(requestCtx, client, kubeletPodListAuthorizedURL(ctx.PodAuthorizedPort))
+func kubeletPodListAuthorizationRequest(requestCtx context.Context, ctx *ManagerCtx) (*http.Client, error) {
+	client, err := kubeletAuthorizedClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+	_, err = kubeletFetchPodList(requestCtx, client, kubeletPodListAuthorizedURL(kubeletHost(ctx), ctx.PodAuthorizedPort))
 	return client, err
 }
 
 func kubeletPodListPortCacheUpdate(requestCtx context.Context, ctx *ManagerCtx) error {
-	if client, err := kubeletPodListHttpRequest(requestCtx, ctx); err == nil {
-		kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
-		kubeletPodListClient = client
-		kubeletPodListRunningEnabled = true
-		return nil
+	host := kubeletHost(ctx)
+	if ctx.PodReadOnlyPort != 0 {
+		client, err := kubeletPodListHttpRequest(requestCtx, ctx)
+		if err == nil {
+			kubeletPodListURL = kubeletPodListReadOnlyURL(ctx.PodReadOnlyPort)
+			kubeletPodListClient = client
+			kubeletPodListRunningEnabled = true
+			return nil
+		}
+		if ctx.PodAuthorizedPort == 0 {
+			return fmt.Errorf("podlist http: %w", err)
+		}
 	}
 
 	// try to fallback https.
@@ -143,7 +283,7 @@ func kubeletPodListPortCacheUpdate(requestCtx context.Context, ctx *ManagerCtx) 
 
 	// update https instance cache
 	kubeletPodListClient = client
-	kubeletPodListURL = kubeletPodListAuthorizedURL(ctx.PodAuthorizedPort)
+	kubeletPodListURL = kubeletPodListAuthorizedURL(host, ctx.PodAuthorizedPort)
 	kubeletPodListRunningEnabled = true
 	return nil
 }
@@ -408,18 +548,20 @@ func parseContainerIPAddress(pod *corev1.Pod) string {
 func kubeletConfigFileDefault() (kubeletConfiguration, error) {
 	empty := kubeletConfiguration{}
 
-	for _, name := range kubeletDefaultConfigPath {
-		data, err := os.ReadFile(name)
-		if err != nil {
-			continue
-		}
+	for _, configPath := range kubeletDefaultConfigPath {
+		for _, name := range hostPathCandidates(configPath) {
+			data, err := os.ReadFile(name)
+			if err != nil {
+				continue
+			}
 
-		config := kubeletConfiguration{}
-		if err := yaml.Unmarshal(data, &config); err != nil {
-			continue
-		}
+			config := kubeletConfiguration{}
+			if err := yaml.Unmarshal(data, &config); err != nil {
+				continue
+			}
 
-		return config, nil
+			return config, nil
+		}
 	}
 
 	return empty, fmt.Errorf("not found kubelet config")
@@ -452,18 +594,34 @@ func kubeletConfigCacheMustUpdate(ctx *ManagerCtx) error {
 			kubeletPodCgroupDriver, kubeletRuntimeEndpoint)
 	}()
 
-	config, err = kubeletConfigDoRequest(
-		kubeletPodListClient,
-		kubeletConfigAuthorizedURL(ctx.PodAuthorizedPort),
-	)
-	if err == nil {
-		return nil
+	var configzErr error
+	if ctx != nil && ctx.PodAuthorizedPort != 0 {
+		client := kubeletPodListClient
+		if client == nil || !strings.HasPrefix(kubeletPodListURL, "https://") {
+			client, configzErr = kubeletAuthorizedClient(ctx)
+		}
+		if configzErr == nil {
+			config, configzErr = kubeletConfigDoRequest(
+				client,
+				kubeletConfigAuthorizedURL(kubeletHost(ctx), ctx.PodAuthorizedPort),
+			)
+			if configzErr == nil {
+				return nil
+			}
+		}
 	}
 
-	log.Debugf("kubelet config port is not available, try to read config files: %v", kubeletDefaultConfigPath)
+	log.Debugf("kubelet config port is not available (%v), try to read config files: %v", configzErr, kubeletDefaultConfigPath)
 
 	config, err = kubeletConfigFileDefault()
 	if err != nil {
+		if configzErr != nil {
+			panic(fmt.Sprintf(
+				"we cannot find any cgroup driver of kubelet after requesting configz (%v) and default files: %v",
+				configzErr,
+				err,
+			))
+		}
 		panic(fmt.Sprintf(
 			"we cannot find any cgroup driver of kubelet after requesting configz and default files: %v",
 			err,

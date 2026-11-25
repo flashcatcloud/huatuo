@@ -17,16 +17,29 @@ package pod
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/tls"
+	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/ccfos/huatuo/internal/log"
 
@@ -497,4 +510,451 @@ func (t bodyReadErrorTransport) RoundTrip(_ *http.Request) (*http.Response, erro
 			iotest.ErrReader(t.readErr),
 		)),
 	}, nil
+}
+
+func TestKubeletTokenClientReReadsRotatedToken(t *testing.T) {
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	var seen []string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, r.Header.Get("Authorization"))
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer srv.Close()
+
+	if _, err := kubeletAuthorizedClient(&ManagerCtx{}); err == nil {
+		t.Fatal("built a token client without a token file")
+	}
+	if err := os.WriteFile(tokenPath, []byte("first\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	client, err := kubeletAuthorizedClient(&ManagerCtx{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kubeletFetchPodList(context.Background(), client, srv.URL+"/pods"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(tokenPath, []byte("second"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := kubeletFetchPodList(context.Background(), client, srv.URL+"/pods"); err != nil {
+		t.Fatal(err)
+	}
+	if len(seen) != 2 || seen[0] != "Bearer first" || seen[1] != "Bearer second" {
+		t.Fatalf("authorization headers = %q", seen)
+	}
+}
+
+func TestInitManagerRequiresCertOrToken(t *testing.T) {
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = filepath.Join(t.TempDir(), "missing")
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	if err := InitManager(&ManagerCtx{PodAuthorizedPort: 10250}); err == nil {
+		ReleaseManager()
+		t.Fatal("started without a client certificate or token")
+	}
+	for _, malformed := range []string{",", "a,", ",b", "a,b,c"} {
+		if err := InitManager(&ManagerCtx{PodAuthorizedPort: 10250, PodClientCertPath: malformed}); err == nil {
+			ReleaseManager()
+			t.Fatalf("accepted malformed client certificate path %q", malformed)
+		}
+	}
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("tok\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	serviceAccountTokenPath = tokenPath
+	if err := InitManager(&ManagerCtx{PodReadOnlyPort: 10255, PodAuthorizedPort: 10250, PodCAPath: filepath.Join(dir, "missing.crt")}); err == nil {
+		ReleaseManager()
+		t.Fatal("started with a nonexistent PodCAPath when PodReadOnlyPort is default")
+	}
+	badCAPath := filepath.Join(dir, "bad-ca.crt")
+	if err := os.WriteFile(badCAPath, []byte("not-a-pem-cert"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := InitManager(&ManagerCtx{PodReadOnlyPort: 10255, PodAuthorizedPort: 10250, PodCAPath: badCAPath}); err == nil {
+		ReleaseManager()
+		t.Fatal("started with an invalid non-PEM PodCAPath")
+	}
+	if err := InitManager(&ManagerCtx{PodAuthorizedPort: 10250, PodHost: "10.20.30.40"}); err == nil {
+		ReleaseManager()
+		t.Fatal("allowed non-loopback PodHost without PodCAPath in token mode")
+	}
+	if _, err := kubeletAuthorizedClient(&ManagerCtx{PodHost: "10.20.30.40"}); err == nil {
+		t.Fatal("kubeletAuthorizedClient allowed non-loopback PodHost without PodCAPath in token mode")
+	}
+}
+
+func TestKubeletTokenClientDoesNotFollowRedirects(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("test-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	for _, tc := range []struct {
+		name      string
+		newTarget func(http.Handler) *httptest.Server
+	}{
+		{name: "https_to_http", newTarget: httptest.NewServer},
+		{name: "https_to_https", newTarget: httptest.NewTLSServer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			target := tc.newTarget(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer target.Close()
+
+			src := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+"/leak", http.StatusFound)
+			}))
+			defer src.Close()
+
+			client, err := kubeletAuthorizedClient(&ManagerCtx{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = kubeletFetchPodList(context.Background(), client, src.URL+"/pods")
+			if err == nil || !strings.Contains(err.Error(), "status: 302") {
+				t.Fatalf("err = %v, want HTTP 302 error", err)
+			}
+			if got := hits.Load(); got != 0 {
+				t.Fatalf("redirect target received %d request(s), want 0", got)
+			}
+		})
+	}
+}
+
+func TestValidateKubeletHost(t *testing.T) {
+	for _, valid := range []string{"", "127.0.0.1", "10.20.30.40", "::1", "fd00::1", "worker-1.cluster.local"} {
+		if err := ValidateKubeletHost(valid); err != nil {
+			t.Fatalf("ValidateKubeletHost(%q) = %v, want nil", valid, err)
+		}
+	}
+	for _, invalid := range []string{"https://10.0.0.1", "10.0.0.1:10250", "10.0.0.1/pods", "node 1", "user@node", "[::1]", "[evil]", `node\foo`, "host%00", "-bad.node"} {
+		if err := ValidateKubeletHost(invalid); err == nil {
+			t.Fatalf("ValidateKubeletHost(%q) = nil, want error", invalid)
+		}
+	}
+}
+
+func TestKubeletTokenClientVerifiesCAAndNodeSANWhenCAPathConfigured(t *testing.T) {
+	newCA := func(cn string, serial int64) (*x509.Certificate, *ecdsa.PrivateKey) {
+		t.Helper()
+		key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tmpl := &x509.Certificate{
+			SerialNumber:          big.NewInt(serial),
+			Subject:               pkix.Name{CommonName: cn},
+			NotBefore:             time.Now().Add(-time.Hour),
+			NotAfter:              time.Now().Add(time.Hour),
+			IsCA:                  true,
+			BasicConstraintsValid: true,
+			KeyUsage:              x509.KeyUsageCertSign,
+		}
+		der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cert, err := x509.ParseCertificate(der)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return cert, key
+	}
+
+	otherCA, _ := newCA("test-other-ca", 1)
+	kubeletCA, kubeletCAKey := newCA("test-kubelet-ca", 2)
+
+	srvKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srvTmpl := &x509.Certificate{
+		SerialNumber: big.NewInt(3),
+		Subject:      pkix.Name{CommonName: "worker-1.cluster.local"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+		DNSNames:     []string{"worker-1.cluster.local"},
+		IPAddresses:  []net.IP{net.ParseIP("10.20.30.40"), net.ParseIP("fd00::1")},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTmpl, kubeletCA, &srvKey.PublicKey, kubeletCAKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var hits atomic.Int32
+	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if r.Header.Get("Authorization") != "Bearer ca-san-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		switch r.URL.Path {
+		case "/pods":
+			_, _ = w.Write([]byte(`{"items":[]}`))
+		case "/configz":
+			_, _ = w.Write([]byte(`{"kubeletconfig":{"cgroupDriver":"systemd","containerRuntimeEndpoint":"unix:///run/containerd/containerd.sock"}}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	srv.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS12,
+		Certificates: []tls.Certificate{{Certificate: [][]byte{srvDER}, PrivateKey: srvKey}},
+	}
+	srv.StartTLS()
+	defer srv.Close()
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("ca-san-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	kubeletCAPath := filepath.Join(dir, "kubelet-ca.crt")
+	if err := os.WriteFile(kubeletCAPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: kubeletCA.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	otherCAPath := filepath.Join(dir, "other-ca.crt")
+	if err := os.WriteFile(otherCAPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: otherCA.Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	port := uint32(srv.Listener.Addr().(*net.TCPAddr).Port)
+	newClient := func(t *testing.T, caPath string) *http.Client {
+		t.Helper()
+		client, err := kubeletAuthorizedClient(&ManagerCtx{PodCAPath: caPath})
+		if err != nil {
+			t.Fatal(err)
+		}
+		tokTransport := client.Transport.(*kubeletTokenTransport)
+		base := tokTransport.base.(*http.Transport)
+		base.DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, srv.Listener.Addr().String())
+		}
+		return client
+	}
+
+	for _, tc := range []struct {
+		name   string
+		caPath string
+		host   string
+		wantOK bool
+	}{
+		{name: "matching_node_ip_san", caPath: kubeletCAPath, host: "10.20.30.40", wantOK: true},
+		{name: "matching_node_ipv6_san", caPath: kubeletCAPath, host: "fd00::1", wantOK: true},
+		{name: "matching_node_dns_san", caPath: kubeletCAPath, host: "worker-1.cluster.local", wantOK: true},
+		{name: "loopback_not_in_san", caPath: kubeletCAPath, host: "127.0.0.1", wantOK: false},
+		{name: "wrong_ca_rejected", caPath: otherCAPath, host: "10.20.30.40", wantOK: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hits.Store(0)
+			client := newClient(t, tc.caPath)
+			_, podsErr := kubeletFetchPodList(context.Background(), client, kubeletPodListAuthorizedURL(tc.host, port))
+			cfg, configzErr := kubeletConfigDoRequest(client, kubeletConfigAuthorizedURL(tc.host, port))
+			if tc.wantOK {
+				if podsErr != nil || configzErr != nil {
+					t.Fatalf("podsErr=%v configzErr=%v, want nil", podsErr, configzErr)
+				}
+				if cfg.CgroupDriver != "systemd" {
+					t.Fatalf("cgroupDriver = %q, want systemd", cfg.CgroupDriver)
+				}
+				if got := hits.Load(); got != 2 {
+					t.Fatalf("hits = %d, want 2 (/pods and /configz)", got)
+				}
+				return
+			}
+			if podsErr == nil || configzErr == nil {
+				t.Fatalf("podsErr=%v configzErr=%v, want TLS errors", podsErr, configzErr)
+			}
+			if got := hits.Load(); got != 0 {
+				t.Fatalf("rejected server received %d request(s), want 0", got)
+			}
+		})
+	}
+
+	// Verify that client-certificate mode also honors PodCAPath when configured.
+	clientKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(4),
+		Subject:      pkix.Name{CommonName: "huatuo-client"},
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
+	}, kubeletCA, &clientKey.PublicKey, kubeletCAKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientKeyDER, err := x509.MarshalECPrivateKey(clientKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientCertFile := filepath.Join(dir, "client.crt")
+	clientKeyFile := filepath.Join(dir, "client.key")
+	if err := os.WriteFile(clientCertFile, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: clientDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(clientKeyFile, pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: clientKeyDER}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Run("client_cert_mode_honors_custom_ca", func(t *testing.T) {
+		hits.Store(0)
+		badClient, err := kubeletAuthorizedClient(&ManagerCtx{
+			PodCAPath:         otherCAPath,
+			podClientCertPath: clientCertFile,
+			podClientCertKey:  clientKeyFile,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		badClient.Transport.(*http.Transport).DialContext = func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var d net.Dialer
+			return d.DialContext(ctx, network, srv.Listener.Addr().String())
+		}
+		if _, err := kubeletFetchPodList(context.Background(), badClient, kubeletPodListAuthorizedURL("10.20.30.40", port)); err == nil {
+			t.Fatal("client-cert mode with wrong PodCAPath should reject server certificate")
+		}
+		if got := hits.Load(); got != 0 {
+			t.Fatalf("client-cert mode sent %d request(s) to untrusted server, want 0", got)
+		}
+	})
+}
+
+func TestReadOnlyPortFailureWithoutAuthorizedPortSkipsHTTPS(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := uint32(ln.Addr().(*net.TCPAddr).Port)
+	_ = ln.Close()
+
+	err = kubeletPodListPortCacheUpdate(context.Background(), &ManagerCtx{PodReadOnlyPort: port})
+	if err == nil {
+		t.Fatal("expected the read-only port error")
+	}
+	if !strings.HasPrefix(err.Error(), "podlist http:") || strings.Contains(err.Error(), "https://") {
+		t.Fatalf("err = %v, want the read-only port error without an HTTPS attempt", err)
+	}
+}
+
+func TestKubeletConfigCacheAfterReadOnlyPodList(t *testing.T) {
+	oldClient, oldURL, oldEnabled := kubeletPodListClient, kubeletPodListURL, kubeletPodListRunningEnabled
+	oldDriver, oldEndpoint, oldPaths := kubeletPodCgroupDriver, kubeletRuntimeEndpoint, kubeletDefaultConfigPath
+	t.Cleanup(func() {
+		kubeletPodListClient = oldClient
+		kubeletPodListURL = oldURL
+		kubeletPodListRunningEnabled = oldEnabled
+		kubeletPodCgroupDriver = oldDriver
+		kubeletRuntimeEndpoint = oldEndpoint
+		kubeletDefaultConfigPath = oldPaths
+	})
+
+	roSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/pods" {
+			http.NotFound(w, r)
+			return
+		}
+		_, _ = w.Write([]byte(`{"items":[]}`))
+	}))
+	defer roSrv.Close()
+	roPort := uint32(roSrv.Listener.Addr().(*net.TCPAddr).Port)
+
+	var configzAuthHeader string
+	authSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/configz" {
+			http.NotFound(w, r)
+			return
+		}
+		configzAuthHeader = r.Header.Get("Authorization")
+		if configzAuthHeader != "Bearer ro-fallback-token" {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"kubeletconfig":{"cgroupDriver":"systemd","containerRuntimeEndpoint":"unix:///run/k3s/containerd/containerd.sock"}}`))
+	}))
+	defer authSrv.Close()
+	authPort := uint32(authSrv.Listener.Addr().(*net.TCPAddr).Port)
+
+	dir := t.TempDir()
+	tokenPath := filepath.Join(dir, "token")
+	if err := os.WriteFile(tokenPath, []byte("ro-fallback-token\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	oldTok := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = oldTok })
+
+	caPath := filepath.Join(dir, "ca.crt")
+	if err := os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: authSrv.Certificate().Raw}), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Read-only /pods succeeds, and PodAuthorizedPort=0 skips HTTPS /configz cleanly.
+	cfgFile := filepath.Join(dir, "kubelet-config.yaml")
+	if err := os.WriteFile(cfgFile, []byte("cgroupDriver: cgroupfs\ncontainerRuntimeEndpoint: unix:///run/containerd/containerd.sock\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	kubeletDefaultConfigPath = []string{cfgFile}
+	ctxNoAuthPort := &ManagerCtx{PodReadOnlyPort: roPort, PodAuthorizedPort: 0}
+	if err := kubeletPodListPortCacheUpdate(context.Background(), ctxNoAuthPort); err != nil {
+		t.Fatal(err)
+	}
+	if err := kubeletConfigCacheMustUpdate(ctxNoAuthPort); err != nil {
+		t.Fatal(err)
+	}
+	if configzAuthHeader != "" {
+		t.Fatalf("PodAuthorizedPort=0 unexpectedly contacted HTTPS /configz")
+	}
+
+	// 2. Read-only /pods succeeds (caching plain HTTP client), and no local config file exists:
+	// kubeletConfigCacheMustUpdate must build an authorized HTTPS client instead of reusing the plain HTTP client.
+	kubeletDefaultConfigPath = []string{filepath.Join(dir, "nonexistent.yaml")}
+	ctxBothPorts := &ManagerCtx{PodReadOnlyPort: roPort, PodAuthorizedPort: authPort, PodCAPath: caPath}
+	if err := kubeletPodListPortCacheUpdate(context.Background(), ctxBothPorts); err != nil {
+		t.Fatal(err)
+	}
+	if strings.HasPrefix(kubeletPodListURL, "https://") {
+		t.Fatalf("kubeletPodListURL = %q, want http:// read-only endpoint", kubeletPodListURL)
+	}
+	if err := kubeletConfigCacheMustUpdate(ctxBothPorts); err != nil {
+		t.Fatal(err)
+	}
+	if configzAuthHeader != "Bearer ro-fallback-token" {
+		t.Fatalf("configzAuthHeader = %q, want Bearer ro-fallback-token", configzAuthHeader)
+	}
+	if kubeletRuntimeEndpoint != "unix:///run/k3s/containerd/containerd.sock" {
+		t.Fatalf("kubeletRuntimeEndpoint = %q, want k3s endpoint", kubeletRuntimeEndpoint)
+	}
 }

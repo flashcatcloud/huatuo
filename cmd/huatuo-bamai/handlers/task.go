@@ -73,16 +73,28 @@ func parseHostTask(req *NewTaskReq, executable string) (*nodeprofiling.StartRequ
 	default:
 		return nil, invalid
 	}
-	if len(a) < 4 || a[0] != "-l" || a[2] != "--pid" {
+	if len(a) < 4 || a[0] != "-l" || (a[2] != "--pid" && a[2] != "--container-id") {
 		return nil, invalid
 	}
 	spec.Language = profiling.Language(a[1])
 	if err := spec.Validate(); err != nil {
 		return nil, err
 	}
-	pid, err := strconv.ParseInt(a[3], 10, 32)
-	if err != nil || pid <= 0 {
-		return nil, invalid
+	// A host PID profiles one process; a container ID profiles the container's
+	// processes and is resolved by the node agent before the profiler starts.
+	start := &nodeprofiling.StartRequest{RequestID: req.RequestID, Scope: observation.ScopeHost, Spec: spec}
+	if a[2] == "--pid" {
+		pid, err := strconv.ParseInt(a[3], 10, 32)
+		if err != nil || pid <= 0 {
+			return nil, invalid
+		}
+		start.HostPID = int(pid)
+	} else {
+		if a[3] == "" {
+			return nil, invalid
+		}
+		start.Scope = observation.ScopeContainer
+		start.ContainerID = a[3]
 	}
 	lang := a[1]
 	a = a[4:]
@@ -114,7 +126,9 @@ func parseHostTask(req *NewTaskReq, executable string) (*nodeprofiling.StartRequ
 	}) {
 		return nil, invalid
 	}
-	return &nodeprofiling.StartRequest{RequestID: req.RequestID, HostPID: int(pid), Duration: time.Duration(duration) * time.Second, Scope: observation.ScopeHost, Spec: spec, OffCPUPhase: phase}, nil
+	start.Duration = time.Duration(duration) * time.Second
+	start.OffCPUPhase = phase
+	return start, nil
 }
 
 func hostTaskRoutes(opts *ServerOptions) []server.Route {

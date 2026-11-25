@@ -54,6 +54,31 @@ func TestHasKprobeFunctionChecksTracefsAndDebugfs(t *testing.T) {
 	}
 }
 
+func TestHasKprobeFunctionReadsHostCopyOnlyWithoutLocal(t *testing.T) {
+	host := t.TempDir()
+	local := filepath.Join(t.TempDir(), "available_filter_functions")
+	if err := os.MkdirAll(filepath.Join(host, filepath.Dir(local)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, local), []byte("host_symbol\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+
+	resetKprobeCacheForTest(t, []string{local})
+	if !HasKprobeFunction("host_symbol") {
+		t.Fatal("host copy must be read when no local layout is readable")
+	}
+
+	if err := os.WriteFile(local, []byte("local_symbol\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetKprobeCacheForTest(t, []string{local})
+	if !HasKprobeFunction("local_symbol") || HasKprobeFunction("host_symbol") {
+		t.Fatal("host copy must not be scanned when a local layout is readable")
+	}
+}
+
 func TestHasKprobeFunctionRetriesFailedReads(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "available_filter_functions")
 	resetKprobeCacheForTest(t, []string{path})
@@ -157,4 +182,29 @@ func resetTraceFSRootsForTest(t *testing.T, roots []string) {
 	t.Cleanup(func() {
 		traceFSRoots = oldRoots
 	})
+}
+
+func TestTracepointAvailableUnderHostMountPrefix(t *testing.T) {
+	local := t.TempDir()
+	host := t.TempDir()
+	// The container's own tracefs mountpoint exists but is empty.
+	if err := os.MkdirAll(filepath.Join(local, "events"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(host, local, "events", "sched", "sched_switch"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, local, "events", "sched", "sched_switch", "id"), []byte("1\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	resetTraceFSRootsForTest(t, []string{local})
+
+	t.Setenv("HOST_MOUNT_PREFIX", "")
+	if ok, _ := TracepointAvailable("sched", "sched_switch"); ok {
+		t.Fatal("tracepoint must not be found without HOST_MOUNT_PREFIX")
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host+"/")
+	if ok, err := TracepointAvailable("sched", "sched_switch"); !ok || err != nil {
+		t.Fatalf("TracepointAvailable() = %v, %v; want host tracefs", ok, err)
+	}
 }

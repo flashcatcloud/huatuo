@@ -126,9 +126,9 @@ func ToSpec(cpu float64, memory int64) *specs.LinuxResources {
 }
 
 func RootFsFilePath(subsys string) string {
-	return filepath.Join(paths.RootfsDefaultPath, subsys)
+	return filepath.Join(paths.Root(), subsys)
 }
 
 func RootfsDefaultPath() string {
-	return paths.RootfsDefaultPath
+	return paths.Root()
 }

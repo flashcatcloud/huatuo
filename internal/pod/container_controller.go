@@ -16,7 +16,6 @@ package pod
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -73,15 +72,35 @@ func InitManager(config *ManagerCtx) error {
 	if config.PodReadOnlyPort == 0 && config.PodAuthorizedPort == 0 {
 		return nil
 	}
-	if config.PodReadOnlyPort == 0 && config.PodClientCertPath == "" {
-		return errors.New("authorized kubelet port requires a client certificate")
+	if err := ValidateKubeletHost(config.PodHost); err != nil {
+		return err
 	}
 	managerConfig := *config
-	certs := strings.Split(config.PodClientCertPath, ",")
-	managerConfig.podClientCertPath = strings.TrimSpace(certs[0])
-	managerConfig.podClientCertKey = managerConfig.podClientCertPath
-	if len(certs) > 1 {
-		managerConfig.podClientCertKey = strings.TrimSpace(certs[1])
+	if certPath := strings.TrimSpace(config.PodClientCertPath); certPath != "" {
+		certs := strings.Split(certPath, ",")
+		managerConfig.podClientCertPath = strings.TrimSpace(certs[0])
+		managerConfig.podClientCertKey = managerConfig.podClientCertPath
+		if len(certs) > 1 {
+			managerConfig.podClientCertKey = strings.TrimSpace(certs[1])
+		}
+		if len(certs) > 2 || managerConfig.podClientCertPath == "" || managerConfig.podClientCertKey == "" {
+			return fmt.Errorf("invalid kubelet client certificate path %q", config.PodClientCertPath)
+		}
+	} else if config.PodReadOnlyPort == 0 {
+		// Without a certificate the HTTPS port authenticates with the Pod's
+		// ServiceAccount token, which only exists when running in a cluster.
+		if _, err := readServiceAccountToken(serviceAccountTokenPath); err != nil {
+			return fmt.Errorf("authorized kubelet port requires a client certificate or a service account token: %w", err)
+		}
+	}
+	if config.PodAuthorizedPort != 0 {
+		if caPath := strings.TrimSpace(managerConfig.PodCAPath); caPath != "" {
+			if _, err := loadKubeletCAPool(caPath); err != nil {
+				return fmt.Errorf("authorized kubelet port requires a valid kubelet CA: %w", err)
+			}
+		} else if managerConfig.podClientCertPath == "" && !isLoopbackKubeletHost(kubeletHost(&managerConfig)) {
+			return fmt.Errorf("non-loopback kubelet host %q requires KubeletCAPath in service account token mode", kubeletHost(&managerConfig))
+		}
 	}
 	dockerAPIVersion = config.DockerAPIVersion
 	controller := newContainerController(containerView)

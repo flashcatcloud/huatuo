@@ -52,13 +52,45 @@ func scanKprobeFunctions(r io.Reader, cache map[string]struct{}) error {
 	return scanner.Err()
 }
 
+// hostPrefixed lists the local paths, then the same paths under HOST_MOUNT_PREFIX.
+func hostPrefixed(paths []string) []string {
+	return append(append([]string{}, paths...), underHostPrefix(paths)...)
+}
+
+func underHostPrefix(paths []string) []string {
+	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
+	if prefix == "" {
+		return nil
+	}
+	out := make([]string, 0, len(paths))
+	for _, p := range paths {
+		if filepath.IsAbs(p) {
+			out = append(out, filepath.Join(prefix, p))
+		}
+	}
+	return out
+}
+
 // loadKprobeFunctions checks both tracefs layouts because current kernels
 // commonly mount tracefs independently while older systems expose it through
-// debugfs. A failed read is retried on the next lookup.
+// debugfs. The host copy lists the same kernel, so it is read only when no
+// local layout is readable. A failed read is retried on the next lookup.
 func loadKprobeFunctions() {
 	cache := make(map[string]struct{})
+	readOK := scanKprobeFiles(kprobeFunctionFiles, cache)
+	if !readOK {
+		readOK = scanKprobeFiles(underHostPrefix(kprobeFunctionFiles), cache)
+	}
+
+	if readOK {
+		kprobeCache = cache
+		kprobeCached = true
+	}
+}
+
+func scanKprobeFiles(paths []string, cache map[string]struct{}) bool {
 	readOK := false
-	for _, path := range kprobeFunctionFiles {
+	for _, path := range paths {
 		file, err := os.Open(path)
 		if err != nil {
 			continue
@@ -69,11 +101,7 @@ func loadKprobeFunctions() {
 			readOK = true
 		}
 	}
-
-	if readOK {
-		kprobeCache = cache
-		kprobeCached = true
-	}
+	return readOK
 }
 
 // HasKprobeFunction returns whether the given symbol is reported as
@@ -92,7 +120,7 @@ func HasKprobeFunction(name string) bool {
 // TracepointAvailable reports whether tracefs exposes the tracepoint event.
 func TracepointAvailable(group, name string) (bool, error) {
 	var statErrors []error
-	for _, root := range traceFSRoots {
+	for _, root := range hostPrefixed(traceFSRoots) {
 		path := filepath.Join(root, "events", group, name, "id")
 		_, err := os.Stat(path)
 		switch {

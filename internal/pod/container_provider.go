@@ -18,7 +18,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path"
+	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -80,7 +83,7 @@ func initContainerProviderEnv(provider containerProvider, apiVersion string) err
 }
 
 func initDockerProviderEnv(apiVersion string) error {
-	client, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithVersion(apiVersion))
+	client, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithHost(dockerHost()), dockerclient.WithVersion(apiVersion))
 	if err != nil {
 		return fmt.Errorf("create docker client: %w", err)
 	}
@@ -99,8 +102,104 @@ func initDockerProviderEnv(apiVersion string) error {
 	return nil
 }
 
+// resolveUnderHostRoot joins an absolute host path under prefix, re-anchoring
+// absolute symlinks (such as /var/run -> /run on Debian/RHEL) back under prefix
+// instead of letting them escape into the container's own filesystem.
+func resolveUnderHostRoot(prefix, hostPath string) (string, bool) {
+	prefix = cleanHostMountPrefix(prefix)
+	if prefix == "" || !filepath.IsAbs(hostPath) {
+		return "", false
+	}
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(hostPath), "/"), "/")
+	cur := prefix
+	for hops := 0; len(parts) > 0; {
+		part := parts[0]
+		parts = parts[1:]
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(cur, part)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			return filepath.Join(append([]string{next}, parts...)...), true
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		hops++
+		if hops > 16 {
+			return "", false
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return "", false
+		}
+		var targetParts []string
+		if filepath.IsAbs(target) {
+			cur = prefix
+			targetParts = strings.Split(strings.TrimPrefix(filepath.Clean(target), "/"), "/")
+		} else {
+			rel := strings.TrimPrefix(filepath.Clean("/"+filepath.Join(strings.TrimPrefix(cur, prefix), target)), "/")
+			cur = prefix
+			targetParts = strings.Split(rel, "/")
+		}
+		parts = append(targetParts, parts...)
+	}
+	return cur, true
+}
+
+func cleanHostMountPrefix(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || !filepath.IsAbs(raw) {
+		return ""
+	}
+	cleaned := filepath.Clean(raw)
+	if cleaned == "/" {
+		return ""
+	}
+	return cleaned
+}
+
+func hostPathCandidates(p string) []string {
+	prefix := cleanHostMountPrefix(os.Getenv("HOST_MOUNT_PREFIX"))
+	if prefix == "" || !filepath.IsAbs(p) {
+		return []string{p}
+	}
+	if resolved, ok := resolveUnderHostRoot(prefix, p); ok {
+		return []string{p, resolved}
+	}
+	return []string{p}
+}
+
+// hostVisiblePath maps a host path into a container mounting the host root at HOST_MOUNT_PREFIX.
+func hostVisiblePath(p string) string {
+	for _, candidate := range hostPathCandidates(p) {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	return p
+}
+
+// runtimeEndpointOnHost applies hostVisiblePath to a unix socket endpoint.
+func runtimeEndpointOnHost(endpoint string) string {
+	if socket, ok := strings.CutPrefix(endpoint, "unix://"); ok {
+		return "unix://" + hostVisiblePath(socket)
+	}
+	return endpoint
+}
+
+// dockerHost honors DOCKER_HOST, else looks for the default socket under HOST_MOUNT_PREFIX too.
+func dockerHost() string {
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		return host
+	}
+	return runtimeEndpointOnHost(dockerclient.DefaultDockerHost)
+}
+
 func initContainerdProviderEnv() error {
-	client, err := k8sremote.NewRemoteRuntimeService(kubeletRuntimeEndpoint, 5*time.Second, nil, nil)
+	client, err := k8sremote.NewRemoteRuntimeService(runtimeEndpointOnHost(kubeletRuntimeEndpoint), 5*time.Second, nil, nil)
 	if err != nil {
 		return fmt.Errorf("create containerd client: %w", err)
 	}

@@ -27,21 +27,36 @@ import (
 	"github.com/ccfos/huatuo/internal/pidfile"
 )
 
-const (
-	defaultDockerRootDir      = "/var/lib/docker"
-	defaultContainerdStateDir = "/run/containerd"
-)
+const defaultDockerRootDir = "/var/lib/docker"
+
+var containerdStateDirs = []string{"/run/containerd", "/run/k3s/containerd"}
 
 func containerInitPid(containerID string) (int, error) {
 	provider, dockerRoot, containerdState := containerRuntimeState()
 	switch provider {
 	case containerProviderDocker:
-		return containerInitPIDInDockerRoot(dockerRoot, containerID)
+		return firstInitPID([]string{dockerRoot}, containerID, containerInitPIDInDockerRoot)
 	case containerProviderContainerd:
-		return containerInitPIDInContainerdState(containerdState, containerID)
+		return firstInitPID([]string{containerdState}, containerID, containerInitPIDInContainerdState)
 	default:
 		return -1, fmt.Errorf("container provider not initialized")
 	}
+}
+
+// firstInitPID tries each dir locally, then under HOST_MOUNT_PREFIX, because an
+// empty local mountpoint can shadow the host's runtime state.
+func firstInitPID(dirs []string, containerID string, lookup func(dir, containerID string) (int, error)) (int, error) {
+	var errs []error
+	for _, dir := range dirs {
+		for _, candidate := range hostPathCandidates(dir) {
+			pid, err := lookup(candidate, containerID)
+			if err == nil {
+				return pid, nil
+			}
+			errs = append(errs, err)
+		}
+	}
+	return -1, errors.Join(errs...)
 }
 
 func containerInitPIDInDockerRoot(rootDir, containerID string) (int, error) {
@@ -97,16 +112,16 @@ func containerInitPIDByID(containerID string) (int, error) {
 	provider, dockerRoot, containerdState := containerRuntimeState()
 	switch provider {
 	case containerProviderDocker:
-		return containerInitPIDInDockerRoot(dockerRoot, containerID)
+		return firstInitPID([]string{dockerRoot}, containerID, containerInitPIDInDockerRoot)
 	case containerProviderContainerd:
-		return containerInitPIDInContainerdState(containerdState, containerID)
+		return firstInitPID([]string{containerdState}, containerID, containerInitPIDInContainerdState)
 	}
 
-	dockerPID, dockerErr := containerInitPIDInDockerRoot(defaultDockerRootDir, containerID)
+	dockerPID, dockerErr := firstInitPID([]string{defaultDockerRootDir}, containerID, containerInitPIDInDockerRoot)
 	if dockerErr == nil {
 		return dockerPID, nil
 	}
-	containerdPID, containerdErr := containerInitPIDInContainerdState(defaultContainerdStateDir, containerID)
+	containerdPID, containerdErr := firstInitPID(containerdStateDirs, containerID, containerInitPIDInContainerdState)
 	if containerdErr == nil {
 		return containerdPID, nil
 	}
