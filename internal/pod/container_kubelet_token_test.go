@@ -20,6 +20,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -69,5 +71,49 @@ func TestInitManagerRequiresCertOrToken(t *testing.T) {
 	if err := InitManager(&ManagerCtx{PodAuthorizedPort: 10250}); err == nil {
 		ReleaseManager()
 		t.Fatal("started without a client certificate or token")
+	}
+}
+
+func TestKubeletTokenClientDoesNotFollowRedirects(t *testing.T) {
+	tokenPath := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(tokenPath, []byte("test-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	old := serviceAccountTokenPath
+	serviceAccountTokenPath = tokenPath
+	t.Cleanup(func() { serviceAccountTokenPath = old })
+
+	for _, tc := range []struct {
+		name      string
+		newTarget func(http.Handler) *httptest.Server
+	}{
+		{name: "https_to_http", newTarget: httptest.NewServer},
+		{name: "https_to_https", newTarget: httptest.NewTLSServer},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			target := tc.newTarget(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				w.WriteHeader(http.StatusOK)
+			}))
+			defer target.Close()
+
+			src := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, target.URL+"/leak", http.StatusFound)
+			}))
+			defer src.Close()
+
+			client, err := kubeletAuthorizedClient(&ManagerCtx{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = kubeletFetchPodList(context.Background(), client, src.URL+"/pods")
+			if err == nil || !strings.Contains(err.Error(), "status: 302") {
+				t.Fatalf("err = %v, want HTTP 302 error", err)
+			}
+			if got := hits.Load(); got != 0 {
+				t.Fatalf("redirect target received %d request(s), want 0", got)
+			}
+		})
 	}
 }

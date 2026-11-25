@@ -143,7 +143,13 @@ func kubeletAuthorizedClient(ctx *ManagerCtx) (*http.Client, error) {
 		InsecureSkipVerify: true, // #nosec G402 -- kubelet serving certs are commonly self-signed
 	}
 	transport := &http.Transport{TLSClientConfig: tlsConfig}
-	client := &http.Client{Timeout: kubeletReqTimeout, Transport: transport}
+	client := &http.Client{
+		Timeout:   kubeletReqTimeout,
+		Transport: transport,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
 	if ctx.podClientCertPath != "" {
 		cert, err := tls.LoadX509KeyPair(ctx.podClientCertPath, ctx.podClientCertKey)
 		if err != nil {
