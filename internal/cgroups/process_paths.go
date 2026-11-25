@@ -16,14 +16,18 @@ package cgroups
 
 import (
 	"bufio"
+	"bytes"
 	"fmt"
 	"io"
 	"os"
 	"path"
+	"runtime"
 	"strconv"
 	"strings"
 
+	"github.com/ccfos/huatuo/internal/cgroups/paths"
 	"github.com/ccfos/huatuo/internal/procfs"
+	"golang.org/x/sys/unix"
 )
 
 // ProcessPaths contains the cgroup membership paths reported for a process.
@@ -53,17 +57,54 @@ func PathsForPID(pid int) (*ProcessPaths, error) {
 	}
 
 	filePath := procfs.Path(strconv.Itoa(pid), "cgroup")
-	file, err := os.Open(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("open pid %d cgroup: %w", pid, err)
+	var reader io.Reader
+	if paths.InPrivateCgroupNS() {
+		if data, err := readInHostCgroupNS(filePath); err == nil {
+			reader = bytes.NewReader(data)
+		}
 	}
-	defer file.Close()
+	if reader == nil {
+		file, err := os.Open(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("open pid %d cgroup: %w", pid, err)
+		}
+		defer file.Close()
+		reader = file
+	}
 
-	paths, err := parseProcessPaths(file)
+	parsed, err := parseProcessPaths(reader)
 	if err != nil {
 		return nil, fmt.Errorf("parse pid %d cgroup: %w", pid, err)
 	}
-	return paths, nil
+	return parsed, nil
+}
+
+// readInHostCgroupNS reads /proc/<pid>/cgroup from PID 1's cgroup namespace so
+// the kernel formats paths relative to the host cgroup root instead of /../..
+func readInHostCgroupNS(filePath string) ([]byte, error) {
+	type result struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		// Leave the OS thread locked so the Go runtime discards it after setns.
+		runtime.LockOSThread()
+		nsFile, err := os.Open("/proc/1/ns/cgroup")
+		if err != nil {
+			ch <- result{err: err}
+			return
+		}
+		defer nsFile.Close()
+		if err := unix.Setns(int(nsFile.Fd()), unix.CLONE_NEWCGROUP); err != nil {
+			ch <- result{err: err}
+			return
+		}
+		data, err := os.ReadFile(filePath)
+		ch <- result{data: data, err: err}
+	}()
+	res := <-ch
+	return res.data, res.err
 }
 
 // PathForProcesses returns the path used to read cgroup.procs on this host.

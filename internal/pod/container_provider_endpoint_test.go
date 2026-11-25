@@ -204,3 +204,26 @@ func TestDockerHostFindsDefaultSocketUnderHostPrefix(t *testing.T) {
 		t.Fatalf("DOCKER_HOST must win, got %q", got)
 	}
 }
+
+func TestDockerHostResolvesAbsoluteSymlinkUnderHostPrefix(t *testing.T) {
+	host := t.TempDir()
+	// Mirror Debian/RHEL where /var/run is an absolute symlink to /run.
+	if err := os.MkdirAll(filepath.Join(host, "run"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(host, "var"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("/run", filepath.Join(host, "var", "run")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, "run", "docker.sock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+	if got, want := dockerHost(), "unix://"+filepath.Join(host, "run", "docker.sock"); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+}

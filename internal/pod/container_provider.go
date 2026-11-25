@@ -102,12 +102,55 @@ func initDockerProviderEnv(apiVersion string) error {
 	return nil
 }
 
+// resolveUnderHostRoot joins an absolute host path under prefix, re-anchoring
+// absolute symlinks (such as /var/run -> /run on Debian/RHEL) back under prefix
+// instead of letting them escape into the container's own filesystem.
+func resolveUnderHostRoot(prefix, hostPath string) string {
+	parts := strings.Split(strings.TrimPrefix(filepath.Clean(hostPath), "/"), "/")
+	cur := prefix
+	for hops := 0; len(parts) > 0; {
+		part := parts[0]
+		parts = parts[1:]
+		if part == "" || part == "." {
+			continue
+		}
+		next := filepath.Join(cur, part)
+		fi, err := os.Lstat(next)
+		if err != nil {
+			return filepath.Join(append([]string{next}, parts...)...)
+		}
+		if fi.Mode()&os.ModeSymlink == 0 {
+			cur = next
+			continue
+		}
+		hops++
+		if hops > 16 {
+			return filepath.Join(append([]string{next}, parts...)...)
+		}
+		target, err := os.Readlink(next)
+		if err != nil {
+			return filepath.Join(append([]string{next}, parts...)...)
+		}
+		var targetParts []string
+		if filepath.IsAbs(target) {
+			cur = prefix
+			targetParts = strings.Split(strings.TrimPrefix(filepath.Clean(target), "/"), "/")
+		} else {
+			rel := strings.TrimPrefix(filepath.Clean("/"+filepath.Join(strings.TrimPrefix(cur, prefix), target)), "/")
+			cur = prefix
+			targetParts = strings.Split(rel, "/")
+		}
+		parts = append(targetParts, parts...)
+	}
+	return cur
+}
+
 func hostPathCandidates(p string) []string {
 	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
 	if prefix == "" || !filepath.IsAbs(p) {
 		return []string{p}
 	}
-	return []string{p, filepath.Join(prefix, p)}
+	return []string{p, resolveUnderHostRoot(prefix, p)}
 }
 
 // hostVisiblePath maps a host path into a container mounting the host root at HOST_MOUNT_PREFIX.

@@ -14,12 +14,46 @@
 
 package paths
 
-import "path/filepath"
+import (
+	"os"
+	"path/filepath"
+	"strings"
+)
 
-var RootfsDefaultPath = "/sys/fs/cgroup"
+const defaultCgroupRoot = "/sys/fs/cgroup"
+
+var RootfsDefaultPath = defaultCgroupRoot
+
+// InPrivateCgroupNS reports whether this process is in a non-root cgroup namespace
+// (e.g. Docker 20.10+ on cgroup v2), where /sys/fs/cgroup hides sibling pods.
+func InPrivateCgroupNS() bool {
+	selfNS, err := os.Readlink("/proc/self/ns/cgroup")
+	if err != nil {
+		return false
+	}
+	hostNS, err := os.Readlink("/proc/1/ns/cgroup")
+	return err == nil && selfNS != hostNS
+}
+
+// Root returns the host cgroupfs root, falling back to HOST_MOUNT_PREFIX when
+// running inside a private cgroup namespace.
+func Root() string {
+	if RootfsDefaultPath != defaultCgroupRoot {
+		return RootfsDefaultPath
+	}
+	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
+	if prefix == "" || !InPrivateCgroupNS() {
+		return RootfsDefaultPath
+	}
+	hostRoot := filepath.Join(prefix, RootfsDefaultPath)
+	if _, err := os.Stat(hostRoot); err == nil {
+		return hostRoot
+	}
+	return RootfsDefaultPath
+}
 
 func Path(path ...string) string {
-	root := []string{RootfsDefaultPath}
+	root := []string{Root()}
 
 	return filepath.Join(append(root, path...)...)
 }
