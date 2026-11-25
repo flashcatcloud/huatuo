@@ -12,6 +12,6 @@
 
 包内包含 `bin/`、`bpf/`、`conf/`、LICENSE、build.json；采样器复用 `build/install-tools.sh` 的固定版本和哈希，保留原始 `tools/`，同时按 Categraf 契约提供 `bin/asprof`、`lib/libasyncProfiler.so`、根目录 `py-spy`。
 
-当前验证涵盖 ELF 架构、华佗静态链接、BPF 对象、解包内容一致性及 CLI 启动。真实内核 BPF 挂载、Doris 写入、采样停止清理与 Categraf 准入需要另做运行验收；制品发布成功不自动放开准入。
+当前验证涵盖 ELF 架构、华佗静态链接、BPF 对象、解包内容一致性及 CLI 启动。真实内核 BPF 挂载、Doris 写入、采样停止清理与 Categraf 准入需要另做运行验收（见 [回归测试清单](flashcat-test-checklist.md)）；制品发布成功不自动放开准入。
 
 原上游 Docker/GitHub Release workflow 保留，Flashcat 仓库禁用其执行以避免同一个 tag 发布到上游镜像名。
