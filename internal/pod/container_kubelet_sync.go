@@ -106,13 +106,9 @@ func kubeletPodListHttpRequest(requestCtx context.Context, ctx *ManagerCtx) (*ht
 	return client, err
 }
 
-// serviceAccountTokenPath is where Kubernetes mounts the Pod's projected
-// ServiceAccount token. A variable so tests can point it elsewhere.
 var serviceAccountTokenPath = "/var/run/secrets/kubernetes.io/serviceaccount/token"
 
-// kubeletTokenTransport authenticates to the kubelet with the Pod's ServiceAccount
-// token. The token is read on every request because the kubelet rotates the
-// projected file well before it expires.
+// kubeletTokenTransport re-reads the rotated ServiceAccount token on each request.
 type kubeletTokenTransport struct {
 	path string
 	base http.RoundTripper

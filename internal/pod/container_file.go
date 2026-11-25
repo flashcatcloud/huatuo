@@ -29,9 +29,6 @@ import (
 
 const defaultDockerRootDir = "/var/lib/docker"
 
-// containerdStateDirs are the containerd state roots tried when the runtime was
-// not discovered through the kubelet, as in a standalone profiler process. k3s
-// runs its own containerd under /run/k3s/containerd.
 var containerdStateDirs = []string{"/run/containerd", "/run/k3s/containerd"}
 
 func containerInitPid(containerID string) (int, error) {
@@ -104,17 +101,22 @@ func containerInitPIDByID(containerID string) (int, error) {
 		return containerInitPIDInContainerdState(containerdState, containerID)
 	}
 
-	dockerPID, err := containerInitPIDInDockerRoot(hostVisiblePath(defaultDockerRootDir), containerID)
-	if err == nil {
-		return dockerPID, nil
-	}
-	errs := []error{err}
-	for _, stateDir := range containerdStateDirs {
-		containerdPID, err := containerInitPIDInContainerdState(hostVisiblePath(stateDir), containerID)
+	var errs []error
+	for _, dockerRoot := range hostPathCandidates(defaultDockerRootDir) {
+		dockerPID, err := containerInitPIDInDockerRoot(dockerRoot, containerID)
 		if err == nil {
-			return containerdPID, nil
+			return dockerPID, nil
 		}
 		errs = append(errs, err)
+	}
+	for _, stateDir := range containerdStateDirs {
+		for _, candidate := range hostPathCandidates(stateDir) {
+			containerdPID, err := containerInitPIDInContainerdState(candidate, containerID)
+			if err == nil {
+				return containerdPID, nil
+			}
+			errs = append(errs, err)
+		}
 	}
 
 	return -1, fmt.Errorf(

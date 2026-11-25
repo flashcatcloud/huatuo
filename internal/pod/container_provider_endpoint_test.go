@@ -79,3 +79,39 @@ func TestContainerInitPIDFallbackFindsK3sStateUnderHostPrefix(t *testing.T) {
 		t.Fatalf("pid = %d", pid)
 	}
 }
+
+func TestContainerInitPIDFallbackSkipsEmptyLocalStateDir(t *testing.T) {
+	localState := t.TempDir()
+	host := t.TempDir()
+	id := "b12508996e52dfaf2dad08db7329f470bbe8993dbdbcb1be4f69b1b7c5d0bc25"
+	hostTaskDir := filepath.Join(host, localState, "io.containerd.runtime.v2.task", "k8s.io", id)
+	if err := os.MkdirAll(hostTaskDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(hostTaskDir, "init.pid"), []byte("5353"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+
+	oldDirs := containerdStateDirs
+	containerdStateDirs = []string{localState}
+	t.Cleanup(func() { containerdStateDirs = oldDirs })
+
+	initMu.Lock()
+	saved := currContainerProvider
+	currContainerProvider = containerProviderNoop
+	initMu.Unlock()
+	t.Cleanup(func() {
+		initMu.Lock()
+		currContainerProvider = saved
+		initMu.Unlock()
+	})
+
+	pid, err := containerInitPIDByID(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pid != 5353 {
+		t.Fatalf("pid = %d, want 5353", pid)
+	}
+}

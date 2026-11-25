@@ -102,23 +102,22 @@ func initDockerProviderEnv(apiVersion string) error {
 	return nil
 }
 
-// hostVisiblePath maps a host path reported by the kubelet or the container
-// runtime into a container that sees the host root under HOST_MOUNT_PREFIX, as
-// the categraf DaemonSet mounts it at /hostfs. Paths such as k3s's
-// /run/k3s/containerd are not visible at their own location there.
-func hostVisiblePath(p string) string {
+func hostPathCandidates(p string) []string {
 	prefix := strings.TrimRight(os.Getenv("HOST_MOUNT_PREFIX"), "/")
 	if prefix == "" || !filepath.IsAbs(p) {
-		return p
+		return []string{p}
 	}
-	if _, err := os.Stat(p); err == nil {
-		return p
+	return []string{p, filepath.Join(prefix, p)}
+}
+
+// hostVisiblePath maps a host path into a container mounting the host root at HOST_MOUNT_PREFIX.
+func hostVisiblePath(p string) string {
+	for _, candidate := range hostPathCandidates(p) {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
 	}
-	onHost := filepath.Join(prefix, p)
-	if _, err := os.Stat(onHost); err != nil {
-		return p
-	}
-	return onHost
+	return p
 }
 
 // runtimeEndpointOnHost applies hostVisiblePath to a unix socket endpoint.
