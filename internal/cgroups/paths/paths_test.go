@@ -20,6 +20,7 @@ import (
 )
 
 func TestPath(t *testing.T) {
+	t.Setenv("HOST_MOUNT_PREFIX", "")
 	tests := []struct {
 		name     string
 		segments []string

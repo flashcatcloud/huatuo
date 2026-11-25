@@ -1,4 +1,4 @@
-// Copyright 2025 The HuaTuo Authors
+// Copyright 2025, 2026 The HuaTuo Authors
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -18,21 +18,27 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 )
 
 const defaultCgroupRoot = "/sys/fs/cgroup"
 
-var RootfsDefaultPath = defaultCgroupRoot
+var (
+	RootfsDefaultPath = defaultCgroupRoot
 
-// InPrivateCgroupNS reports whether this process is in a non-root cgroup namespace
-// (e.g. Docker 20.10+ on cgroup v2), where /sys/fs/cgroup hides sibling pods.
+	inPrivateCgroupNS = sync.OnceValue(func() bool {
+		selfNS, err := os.Readlink("/proc/self/ns/cgroup")
+		if err != nil {
+			return false
+		}
+		hostNS, err := os.Readlink("/proc/1/ns/cgroup")
+		return err == nil && selfNS != hostNS
+	})
+)
+
+// InPrivateCgroupNS reports whether this process runs in a non-root cgroup namespace.
 func InPrivateCgroupNS() bool {
-	selfNS, err := os.Readlink("/proc/self/ns/cgroup")
-	if err != nil {
-		return false
-	}
-	hostNS, err := os.Readlink("/proc/1/ns/cgroup")
-	return err == nil && selfNS != hostNS
+	return inPrivateCgroupNS()
 }
 
 // Root returns the host cgroupfs root, falling back to HOST_MOUNT_PREFIX when

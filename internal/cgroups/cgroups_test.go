@@ -201,6 +201,7 @@ func TestToSpec(t *testing.T) {
 // TestRootFsFilePath verifies filepath.Join semantics against the rootfs base,
 // including the RootfsDefaultPath() accessor (empty-subsystem case).
 func TestRootFsFilePath(t *testing.T) {
+	t.Setenv("HOST_MOUNT_PREFIX", "")
 	base := paths.RootfsDefaultPath
 
 	tests := []struct {

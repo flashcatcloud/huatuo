@@ -25,9 +25,10 @@ import (
 	"strconv"
 	"strings"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/ccfos/huatuo/internal/cgroups/paths"
 	"github.com/ccfos/huatuo/internal/procfs"
-	"golang.org/x/sys/unix"
 )
 
 // ProcessPaths contains the cgroup membership paths reported for a process.
@@ -59,11 +60,12 @@ func PathsForPID(pid int) (*ProcessPaths, error) {
 	filePath := procfs.Path(strconv.Itoa(pid), "cgroup")
 	var reader io.Reader
 	if paths.InPrivateCgroupNS() {
-		if data, err := readInHostCgroupNS(filePath); err == nil {
-			reader = bytes.NewReader(data)
+		data, err := readInHostCgroupNS(filePath)
+		if err != nil {
+			return nil, fmt.Errorf("read pid %d cgroup in host namespace: %w", pid, err)
 		}
-	}
-	if reader == nil {
+		reader = bytes.NewReader(data)
+	} else {
 		file, err := os.Open(filePath)
 		if err != nil {
 			return nil, fmt.Errorf("open pid %d cgroup: %w", pid, err)
@@ -137,7 +139,11 @@ func parseProcessPaths(reader io.Reader) (*ProcessPaths, error) {
 			return nil, fmt.Errorf("invalid cgroup entry %q", line)
 		}
 
-		cgroupPath := path.Clean("/" + strings.TrimPrefix(membershipPath, "/"))
+		trimmed := strings.TrimPrefix(membershipPath, "/")
+		if trimmed == ".." || strings.HasPrefix(trimmed, "../") {
+			return nil, fmt.Errorf("cgroup path %q escapes current cgroup namespace", membershipPath)
+		}
+		cgroupPath := path.Clean("/" + trimmed)
 		if controllers == "" {
 			result.Unified = cgroupPath
 			continue
