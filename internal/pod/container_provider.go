@@ -83,7 +83,7 @@ func initContainerProviderEnv(provider containerProvider, apiVersion string) err
 }
 
 func initDockerProviderEnv(apiVersion string) error {
-	client, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithVersion(apiVersion))
+	client, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithHost(dockerHost()), dockerclient.WithVersion(apiVersion))
 	if err != nil {
 		return fmt.Errorf("create docker client: %w", err)
 	}
@@ -126,6 +126,14 @@ func runtimeEndpointOnHost(endpoint string) string {
 		return "unix://" + hostVisiblePath(socket)
 	}
 	return endpoint
+}
+
+// dockerHost honors DOCKER_HOST, else looks for the default socket under HOST_MOUNT_PREFIX too.
+func dockerHost() string {
+	if host := os.Getenv("DOCKER_HOST"); host != "" {
+		return host
+	}
+	return runtimeEndpointOnHost(dockerclient.DefaultDockerHost)
 }
 
 func initContainerdProviderEnv() error {

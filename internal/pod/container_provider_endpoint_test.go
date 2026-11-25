@@ -17,7 +17,10 @@ package pod
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+
+	dockerclient "github.com/docker/docker/client"
 )
 
 func TestRuntimeEndpointOnHost(t *testing.T) {
@@ -174,5 +177,30 @@ func TestKubeletConfigFileDefaultReadsUnderHostMountPrefix(t *testing.T) {
 	}
 	if config.CgroupDriver != "systemd" {
 		t.Fatalf("cgroupDriver = %q, want systemd", config.CgroupDriver)
+	}
+}
+
+func TestDockerHostFindsDefaultSocketUnderHostPrefix(t *testing.T) {
+	host := t.TempDir()
+	sock := strings.TrimPrefix(dockerclient.DefaultDockerHost, "unix://")
+	if err := os.MkdirAll(filepath.Join(host, filepath.Dir(sock)), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(host, sock), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("DOCKER_HOST", "")
+	t.Setenv("HOST_MOUNT_PREFIX", "")
+	if got := dockerHost(); got != dockerclient.DefaultDockerHost {
+		t.Fatalf("without a prefix got %q", got)
+	}
+	t.Setenv("HOST_MOUNT_PREFIX", host)
+	if got, want := dockerHost(), "unix://"+filepath.Join(host, sock); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	t.Setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
+	if got := dockerHost(); got != "tcp://10.0.0.1:2375" {
+		t.Fatalf("DOCKER_HOST must win, got %q", got)
 	}
 }
